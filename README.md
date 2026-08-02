@@ -1,79 +1,110 @@
-# EV_ErgMt
+# DJY EV Telemetry
 
-Assetto Corsa telemetry를 Formula E 스타일의 EV 전력 신호로 변환하고,
-기존 `fsk-energymeter` Data Viewer에서 읽을 수 있는 바이너리 `.log` 파일을 생성합니다.
+Assetto Corsa 가상 텔레메트리와 실제 EV 에너지미터 데이터를 서로 분리해 표시하는
+Windows C++ 대시보드입니다. GUI는 CMake, Dear ImGui, Win32, DirectX 11로 구성됩니다.
 
-## Assetto Corsa에서 직접 기록
+## 화면
 
-1. Assetto Corsa를 실행합니다.
-2. 아래 캡처 프로그램을 실행합니다. 게임보다 먼저 실행해도 자동으로 기다립니다.
+### 실시간 텔레메트리
 
-```powershell
-cd F:\PROJECT\EV_ErgMt
-.\start_ac_capture.ps1
+가상 신호와 실제 하드웨어 신호를 별도 창으로 분리하고, 드라이버 입력·타이어·브레이크·랩타임·트랙 맵·에너지 정보를 실시간으로 표시합니다.
+
+![DJY EV Telemetry 실시간 대시보드](docs/assets/live-dashboard.png)
+
+### 에너지 로그 열람
+
+FSK-EEM 호환 로그의 요약값, 선택 샘플, 전압·전류·전력 파형과 타임라인 위치를 한 화면에서 확인합니다.
+
+![DJY EV Telemetry 기록 열람 창](docs/assets/recorded-energy-log.png)
+
+## 실행
+
+프로젝트 루트의 다음 파일을 더블클릭합니다.
+
+```text
+run_dashboard.bat
 ```
 
-3. 차량과 트랙을 선택하고 주행을 시작합니다.
-4. 주행 세션을 종료하면 3초 후 `sessions\AC_EV_날짜_시간.log`로 자동 저장됩니다.
-5. `.\start_viewer.ps1`을 실행하고 저장된 로그를 선택합니다.
-
-Docker로 뷰어를 실행하려면 다음을 사용합니다.
+실행 파일이 없으면 Visual Studio CMake로 자동 빌드합니다. 강제로 다시 빌드하려면:
 
 ```powershell
-.\start_docker_viewer.ps1
+.\run_dashboard.bat rebuild
 ```
 
-캡처 프로그램은 `ASC_TLMTSYS`와 같은 Assetto Corsa 공유 메모리를 사용합니다.
-속도, 스로틀, 브레이크뿐 아니라 ERS/KERS 회수 상태를 회생제동 계산에 반영하며
-FSK 에너지미터와 같은 100 Hz로 기록합니다.
+## 데이터 구분
 
-## 바로 확인하기
+- `VIRTUAL SIGNAL`: Assetto Corsa 공유 메모리 또는 내장 데모에서 계산한 추정값
+- `REAL HARDWARE SIGNAL`: 향후 CAN/UART로 수신할 실제 회로 계측값
+- 게임 패킷이 1.5초 이상 갱신되지 않으면 `OFFLINE`
+- 실제 창에는 가상값을 복사하지 않으며 미연결 시 `--`를 표시
 
-```powershell
-cd F:\PROJECT\EV_ErgMt
-.\make_demo.ps1
-.\start_viewer.ps1
+현재 실제 `fsk-energymeter` 펌웨어는 주행 중 SD 기록만 수행하므로, 실제 창의 실시간
+표시에는 별도의 CAN/UART 송신 펌웨어와 수신 인터페이스가 필요합니다.
+
+## 가상 로그 자동 기록
+
+대시보드는 Assetto Corsa의 `AC_LIVE` 패킷을 감지하면 실제 FSK-EEM과 동일한 16-byte
+레코드 형식으로 자동 기록합니다.
+
+```text
+data/dummy/VIRTUAL_AC_YYYYMMDD_HHMMSS.log
 ```
 
-브라우저의 **Data Viewer** 탭에서
-`F:\PROJECT\EV_ErgMt\output\formula_e_demo.log`를 선택합니다.
-Formula E 더미 데이터의 전압, 전류, 출력, 누적 에너지, 회생제동 구간을 기존
-에너지미터 로직과 그래프로 확인할 수 있습니다.
+- 별도 기록 스레드에서 10 ms 간격(100 Hz)으로 기록
+- 10개 레코드마다 파일 flush(약 100 ms)
+- AC 세션 시작 시 새 로그 생성
+- 세션 종료 상태가 3초 지속되면 로그 종료
+- 실제 FSK-EEM과 동일한 magic, timestamp, 단위, XOR checksum 사용
+- 합성 UID를 사용하므로 열람 창에서 `VIRTUAL RECORDED LOG`로 판별
+- `OPEN LATEST DUMMY` 버튼으로 현재/최근 가상 로그 열기
 
-뷰어의 기본 Power Limit은 80 kW이므로 Formula E 데이터에는 350 kW로 설정하는
-것이 좋습니다.
+프로그램이 종료될 때도 열린 로그를 flush하고 닫습니다. `data/dummy/*.log`는 생성 데이터라
+Git에서 제외됩니다.
 
-## ASC_TLMTSYS CSV 변환
+## 프로젝트 구조
 
-`ASC_TLMTSYS`가 사용하는 `Time,Speed,RPM,Gear,Gas,Brake` CSV를 직접 변환합니다.
-
-```powershell
-python .\generate_ev_log.py `
-  --csv ..\ASC_TLMTSYS\telemetry_log.csv `
-  --output .\output\assetto_corsa_ev.log
+```text
+DJY_EvTLMT/
+├─ CMakeLists.txt
+├─ run_dashboard.bat        # 사용자 원클릭 실행
+├─ README.md
+├─ src/
+│  ├─ main.cpp
+│  ├─ ui/                   # ImGui 대시보드 화면
+│  └─ telemetry/            # AC 공유 메모리와 통신 데이터 소스
+├─ scripts/
+│  └─ build.ps1             # 개발용 CMake 빌드
+├─ docs/
+│  └─ CAN_INTEGRATION.md
+├─ third_party/
+│  ├─ imgui/                # 빌드에 필요한 Dear ImGui 파일만 포함
+│  └─ json/                 # nlohmann single-header JSON
+├─ data/
+│  └─ dummy/                # 자동 생성되는 가상 FSK-EEM 로그
 ```
 
-열 이름은 대소문자를 구분하지 않으며 `Throttle`, `speed_kmh`, `timestamp` 별칭도
-인식합니다. Gas/Brake가 0~1 또는 0~100 어느 범위여도 자동으로 정규화합니다.
+`build/`와 `bin/`은 자동 생성되며 Git에서 제외됩니다.
 
-## 변환 모델
+## 대시보드 창
 
-- 최대 구동 출력: 350 kW
-- 최대 회생 입력: 350 kW
-- 공칭 HV 전압: 약 600 V
-- 전류 범위: -749~749 A
-- 12 V 보조 전원과 부하 기반 온도 신호 포함
-- 양의 전류는 배터리 방전/구동, 음의 전류는 회생제동
+- Driver Inputs & Drivetrain `[VIRTUAL]`
+- EV Energy `[VIRTUAL]`
+- Tyre & Brake `[VIRTUAL]`
+- Timing `[VIRTUAL]`
+- Track Map `[VIRTUAL]`
+- Real Hardware Energy
+- Recorded Energy Log
 
-전력 신호는 AC의 속도, 스로틀 및 브레이크를 적극 사용하지만, Assetto Corsa가
-실제 Formula E 배터리 전압과 전류를 제공하지 않으므로 결과는 물리 기반의
-시각화용 추정 데이터이며 공식 계측값이 아닙니다.
+컨트롤 창의 체크박스는 위 정보창과 1:1로 대응합니다.
 
-## 구성
+`Recorded Energy Log` 창은 FSK-EEM `.log`의 체크섬을 검증하고 전압·전류·전력 파형,
+선택 샘플, 소비·회생·순에너지와 손상 패킷 수를 표시합니다. 합성 UID 로그는
+`VIRTUAL RECORDED LOG`, 실제 장치 UID 로그는 `MEASURED HARDWARE LOG`로 구분합니다.
 
-- `generate_ev_log.py`: CSV 변환기와 100 Hz Formula E 더미 랩 생성기
-- `capture_assetto_corsa.py`: AC 공유 메모리를 직접 읽는 100 Hz 실시간 기록기
-- `start_ac_capture.ps1`: 게임 연동 기록 실행
-- `make_demo.ps1`: 샘플 로그 재생성
-- `start_viewer.ps1`: 기존 FSK-EEM Vue 뷰어 실행
-- `output/formula_e_demo.log`: 즉시 열어볼 수 있는 샘플
+## 실제 CAN 연동
+
+CAN 하드웨어, 메시지 ID, 스케일, 상태 판정, 배선 및 펌웨어 요구사항은
+[CAN 연동 문서](docs/CAN_INTEGRATION.md)를 참고하십시오.
+
+> 대회에서 지급하거나 공식 판정에 사용하는 에너지미터의 펌웨어와 회로는 임의로
+> 변경하지 마십시오. CAN 수정은 자작 계측기 또는 별도 보조 계측기에만 적용합니다.
