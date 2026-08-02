@@ -3,6 +3,8 @@
 Assetto Corsa 가상 텔레메트리와 실제 EV 에너지미터 데이터를 서로 분리해 표시하는
 Windows C++ 대시보드입니다. GUI는 CMake, Dear ImGui, Win32, DirectX 11로 구성됩니다.
 
+이 프로젝트는 [ASC_TLMTSYS](https://github.com/20233332choi/ASC_TLMTSYS.git)에서 파생되었습니다.
+
 ## 화면
 
 ### 실시간 텔레메트리
