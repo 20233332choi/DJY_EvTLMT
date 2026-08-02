@@ -1,7 +1,0 @@
-:9800 {
-	root * /srv
-	uri strip_prefix /energymeter
-	try_files {path} /index.html
-	file_server
-	encode zstd gzip
-}
