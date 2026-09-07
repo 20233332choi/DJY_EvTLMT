@@ -19,7 +19,22 @@ namespace {
 constexpr ImGuiTableFlags kTableFlags =
     ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame;
 
-const char* OnlineText(bool online) { return online ? "정상" : "대기"; }
+void RenderSignalStatus(bool online, bool valid, float ageMs) {
+    if (online && valid) {
+        ImGui::TextColored(COLOR_OK_GREEN, "수신 중");
+    } else if (online) {
+        ImGui::TextColored(COLOR_ALERT_RED, "수신됨 · 값 오류");
+    } else if (ageMs < 0.0f) {
+        ImGui::TextColored(COLOR_MUTED, "미수신");
+    } else {
+        ImGui::TextColored(COLOR_WARN_AMBER, "오래됨 · %.1f초", ageMs / 1000.0f);
+    }
+}
+
+void RenderMissing(float ageMs) {
+    if (ageMs < 0.0f) ImGui::TextColored(COLOR_MUTED, "-- · 미수신");
+    else ImGui::TextColored(COLOR_WARN_AMBER, "-- · 오래됨 %.1f초", ageMs / 1000.0f);
+}
 
 std::string WideFieldToUtf8(const wchar_t* value, size_t capacity) {
     size_t length = 0;
@@ -90,22 +105,22 @@ void DashboardUI::Render(IDataSource* dataSource) {
     const bool connected = dataSource->IsConnected();
     UpdateGnssTrail(*telemetry);
     RenderSystemStatus(dataSource, *telemetry);
-    if (showVehicleWindow_) RenderVehicle(*telemetry, connected);
+    if (showVehicleWindow_) RenderVehicle(*telemetry);
     if (showBatteryWindow_) RenderBattery(*telemetry, connected);
     if (showGnssWindow_) RenderGnss(*telemetry, connected);
-    if (showControlWindow_) RenderControl(*telemetry, connected);
+    if (showControlWindow_) RenderControl(*telemetry, connected && telemetry->vehicleOnline);
     if (showRecordedLogWindow_) RenderRecordedLog();
 }
 
 void DashboardUI::RenderSystemStatus(IDataSource* source, const EVTelemetry& t) {
     const bool connected = source->IsConnected();
     ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(360, 270), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(360, 305), ImGuiCond_Once);
     ImGui::Begin("시스템 상태", nullptr, ImGuiWindowFlags_NoCollapse);
 
     ImGui::SetWindowFontScale(1.20f);
     ImGui::TextColored(connected ? COLOR_OK_GREEN : COLOR_ALERT_RED,
-                       connected ? "실차 텔레메트리 수신 중" : "실차 텔레메트리 수신 대기");
+                       connected ? "Gateway UDP 수신 중" : "Gateway UDP 미수신");
     ImGui::SetWindowFontScale(1.0f);
     ImGui::TextDisabled("입력: %s", source->GetSourceName());
     ImGui::TextDisabled("SEQ %u  |  지연 %.2f초  |  %.1f Hz", t.sequence, t.ageSeconds, t.receiveRateHz);
@@ -113,11 +128,21 @@ void DashboardUI::RenderSystemStatus(IDataSource* source, const EVTelemetry& t) 
 
     if (ImGui::BeginTable("SystemLinks", 2, kTableFlags)) {
         ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::TextDisabled("Rear STM");
-        ImGui::TextColored(t.stmOnline ? COLOR_OK_GREEN : COLOR_ALERT_RED, "%s", OnlineText(t.stmOnline));
-        ImGui::TableNextColumn(); ImGui::TextDisabled("Front 센서/CAN");
-        ImGui::TextColored(t.frontSensorOnline && t.canOk ? COLOR_OK_GREEN : COLOR_WARN_AMBER,
-                           "%s / %s", OnlineText(t.frontSensorOnline), t.canOk ? "CAN 정상" : "CAN 대기");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("차량 STM");
+        RenderSignalStatus(t.vehicleOnline, t.stmOnline, t.vehicleAgeMs);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("좌 / 우 RPM");
+        ImGui::TextColored(t.rpmLeftOnline ? COLOR_OK_GREEN : COLOR_WARN_AMBER, "좌 %s", t.rpmLeftOnline ? "수신" : "미수신");
+        ImGui::SameLine(); ImGui::TextColored(t.rpmRightOnline ? COLOR_OK_GREEN : COLOR_WARN_AMBER,
+                                              "· 우 %s", t.rpmRightOnline ? "수신" : "미수신");
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("TPS / SAS");
+        ImGui::TextColored(t.tpsOnline ? COLOR_OK_GREEN : COLOR_WARN_AMBER, "TPS %s", t.tpsOnline ? "수신" : "미수신");
+        ImGui::SameLine(); ImGui::TextColored(t.sasOnline ? COLOR_OK_GREEN : COLOR_WARN_AMBER,
+                                              "· SAS %s", t.sasOnline ? "수신" : "미수신");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("IMU / Rear 출력");
+        ImGui::TextColored(t.imuOnline ? COLOR_OK_GREEN : COLOR_WARN_AMBER, "IMU %s", t.imuOnline ? "수신" : "미수신");
+        ImGui::SameLine(); ImGui::TextColored(t.rearOutputOnline ? COLOR_OK_GREEN : COLOR_WARN_AMBER,
+                                              "· 출력 %s", t.rearOutputOnline ? "수신" : "미수신");
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); ImGui::TextDisabled("BMS");
         ImGui::TextColored(t.bmsOnline && !t.bmsFault ? COLOR_OK_GREEN : COLOR_WARN_AMBER,
@@ -141,13 +166,13 @@ void DashboardUI::RenderSystemStatus(IDataSource* source, const EVTelemetry& t) 
     ImGui::End();
 }
 
-void DashboardUI::RenderVehicle(const EVTelemetry& t, bool connected) {
+void DashboardUI::RenderVehicle(const EVTelemetry& t) {
     ImGui::SetNextWindowPos(ImVec2(392, 16), ImGuiCond_Once);
     ImGui::SetNextWindowSize(ImVec2(990, 410), ImGuiCond_Once);
     ImGui::Begin("차량 실시간 센서", &showVehicleWindow_, ImGuiWindowFlags_NoCollapse);
 
-    ImGui::TextColored(connected ? COLOR_OK_GREEN : COLOR_ALERT_RED,
-                       connected ? "실제 차량 데이터" : "UDP 9004 수신 대기");
+    ImGui::TextColored(t.vehicleOnline ? COLOR_OK_GREEN : COLOR_ALERT_RED,
+                       t.vehicleOnline ? "차량 패킷 수신 중" : "차량 패킷 미수신");
     ImGui::SameLine();
     ImGui::TextDisabled("패킷 %llu / 누락 %llu  |  전송경로 %s",
                         static_cast<unsigned long long>(t.receivedPackets),
@@ -157,20 +182,23 @@ void DashboardUI::RenderVehicle(const EVTelemetry& t, bool connected) {
     if (ImGui::BeginTable("VehiclePrimary", 3, kTableFlags)) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); BeginMetric("차량 속도");
-        if (connected) ImGui::TextColored(COLOR_INFO_CYAN, "%.1f km/h", t.speedKmh); else ImGui::Text("--"); EndMetric();
+        const bool speedLive = t.speedOnline || (t.rpmLeftOnline && t.rpmRightOnline);
+        if (speedLive) ImGui::TextColored(COLOR_INFO_CYAN, "%.1f km/h", t.speedKmh); else RenderMissing(t.speedAgeMs); EndMetric();
         ImGui::TableNextColumn(); BeginMetric("좌측 모터");
-        if (connected) ImGui::Text("%u RPM", t.rpmLeft); else ImGui::Text("--"); EndMetric();
+        if (t.rpmLeftOnline && t.motorLeftOk) ImGui::Text("%u RPM", t.rpmLeft); else if (t.rpmLeftOnline) ImGui::TextColored(COLOR_ALERT_RED, "-- · 값 오류"); else RenderMissing(t.rpmLeftAgeMs); EndMetric();
         ImGui::TableNextColumn(); BeginMetric("우측 모터");
-        if (connected) ImGui::Text("%u RPM", t.rpmRight); else ImGui::Text("--"); EndMetric();
+        if (t.rpmRightOnline && t.motorRightOk) ImGui::Text("%u RPM", t.rpmRight); else if (t.rpmRightOnline) ImGui::TextColored(COLOR_ALERT_RED, "-- · 값 오류"); else RenderMissing(t.rpmRightAgeMs); EndMetric();
         ImGui::EndTable();
     }
 
     ImGui::Spacing();
-    ImGui::TextDisabled("가속 페달 (TPS)  |  RAW %s", connected ? std::to_string(t.tpsRaw).c_str() : "--");
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, t.tpsOk ? COLOR_OK_GREEN : COLOR_ALERT_RED);
-    char throttleText[32] = "--";
-    if (connected && t.tpsOk) snprintf(throttleText, sizeof(throttleText), "%.1f %%", t.tpsPercent);
-    ImGui::ProgressBar(connected && t.tpsOk ? std::clamp(t.tpsPercent / 100.0f, 0.0f, 1.0f) : 0.0f,
+    ImGui::TextDisabled("가속 페달 (TPS)  |  RAW %s", t.tpsOnline ? std::to_string(t.tpsRaw).c_str() : "--");
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, t.tpsOnline && t.tpsOk ? COLOR_OK_GREEN : COLOR_ALERT_RED);
+    char throttleText[48] = "미수신";
+    if (t.tpsOnline && t.tpsOk) snprintf(throttleText, sizeof(throttleText), "%.1f %%", t.tpsPercent);
+    else if (t.tpsOnline) snprintf(throttleText, sizeof(throttleText), "값 오류");
+    else if (t.tpsAgeMs >= 0.0f) snprintf(throttleText, sizeof(throttleText), "오래됨 %.1f초", t.tpsAgeMs / 1000.0f);
+    ImGui::ProgressBar(t.tpsOnline && t.tpsOk ? std::clamp(t.tpsPercent / 100.0f, 0.0f, 1.0f) : 0.0f,
                        ImVec2(-1.0f, 24.0f), throttleText);
     ImGui::PopStyleColor();
 
@@ -178,17 +206,17 @@ void DashboardUI::RenderVehicle(const EVTelemetry& t, bool connected) {
     if (ImGui::BeginTable("VehicleSensors", 4, kTableFlags)) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); ImGui::TextDisabled("조향각");
-        if (connected && t.sasOk) ImGui::TextColored(COLOR_INFO_CYAN, "%+.2f deg", t.steeringDeg); else ImGui::Text("--");
-        ImGui::TextDisabled("SAS 상대 %+.2f deg", t.sasRelativeDeg);
+        if (t.sasOnline && t.sasOk) ImGui::TextColored(COLOR_INFO_CYAN, "%+.2f deg", t.steeringDeg); else if (t.sasOnline) ImGui::TextColored(COLOR_ALERT_RED, "-- · 값 오류"); else RenderMissing(t.sasAgeMs);
+        if (t.sasOnline) ImGui::TextDisabled("SAS 상대 %+.2f deg", t.sasRelativeDeg);
         ImGui::TableNextColumn(); ImGui::TextDisabled("SAS 원시값");
-        if (connected) ImGui::Text("%u / 16383", t.sasRaw); else ImGui::Text("--");
-        ImGui::TextDisabled("중앙값 %u", t.sasCenterRaw);
+        if (t.sasOnline) ImGui::Text("%u / 16383", t.sasRaw); else RenderMissing(t.sasAgeMs);
+        if (t.sasOnline) ImGui::TextDisabled("중앙값 %u", t.sasCenterRaw);
         ImGui::TableNextColumn(); ImGui::TextDisabled("Yaw rate");
-        if (connected) ImGui::Text("%.3f rad/s", t.yawRateRadS); else ImGui::Text("--");
-        ImGui::TextDisabled("Rear IMU");
+        if (t.imuOnline && t.imuOk) ImGui::Text("%.3f rad/s", t.yawRateRadS); else if (t.imuOnline) ImGui::TextColored(COLOR_ALERT_RED, "-- · 값 오류"); else RenderMissing(t.imuAgeMs);
+        ImGui::TextDisabled("Rear IMU 상태");
         ImGui::TableNextColumn(); ImGui::TextDisabled("횡가속도");
-        if (connected) ImGui::Text("%.2f m/s²", t.lateralAccelMS2); else ImGui::Text("--");
-        ImGui::TextDisabled("펄스 L/R %u / %u", t.captureLeft, t.captureRight);
+        if (t.imuOnline && t.imuOk) ImGui::Text("%.2f m/s²", t.lateralAccelMS2); else if (t.imuOnline) ImGui::TextColored(COLOR_ALERT_RED, "-- · 값 오류"); else RenderMissing(t.imuAgeMs);
+        if (t.rpmLeftOnline || t.rpmRightOnline) ImGui::TextDisabled("펄스 L/R %u / %u", t.captureLeft, t.captureRight);
         ImGui::EndTable();
     }
 
@@ -196,15 +224,15 @@ void DashboardUI::RenderVehicle(const EVTelemetry& t, bool connected) {
     if (ImGui::BeginTable("VehicleOutput", 4, kTableFlags)) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); ImGui::TextDisabled("좌측 출력");
-        if (connected) ImGui::Text("DAC %u  |  %.2f kW", t.dacLeft, t.powerLeftKw); else ImGui::Text("--");
+        if (t.rearOutputOnline) ImGui::Text("DAC %u  |  %.2f kW", t.dacLeft, t.powerLeftKw); else RenderMissing(t.rearOutputAgeMs);
         ImGui::TableNextColumn(); ImGui::TextDisabled("우측 출력");
-        if (connected) ImGui::Text("DAC %u  |  %.2f kW", t.dacRight, t.powerRightKw); else ImGui::Text("--");
+        if (t.rearOutputOnline) ImGui::Text("DAC %u  |  %.2f kW", t.dacRight, t.powerRightKw); else RenderMissing(t.rearOutputAgeMs);
         ImGui::TableNextColumn(); ImGui::TextDisabled("TQV 요청 / 적용");
-        if (connected) ImGui::Text("%.0f%% / %.0f%%", t.tvRequestedPercent, t.tvAppliedPercent); else ImGui::Text("--");
-        ImGui::TextColored(t.tvLimited ? COLOR_WARN_AMBER : COLOR_OK_GREEN, "%s", t.tvLimited ? "제한됨" : (t.tvActive ? "작동" : "대기"));
+        if (t.rearOutputOnline) ImGui::Text("%.0f%% / %.0f%%", t.tvRequestedPercent, t.tvAppliedPercent); else RenderMissing(t.rearOutputAgeMs);
+        if (t.rearOutputOnline) ImGui::TextColored(t.tvLimited ? COLOR_WARN_AMBER : COLOR_OK_GREEN, "%s", t.tvLimited ? "제한됨" : (t.tvActive ? "작동" : "대기"));
         ImGui::TableNextColumn(); ImGui::TextDisabled("회생 요청 / 적용");
-        if (connected) ImGui::Text("%.0f%% / %.0f%%", t.regenRequestedPercent, t.regenAppliedPercent); else ImGui::Text("--");
-        ImGui::TextColored(t.regenReady ? COLOR_OK_GREEN : COLOR_WARN_AMBER, "%s", t.regenReady ? "준비" : "검증 대기");
+        if (t.rearOutputOnline) ImGui::Text("%.0f%% / %.0f%%", t.regenRequestedPercent, t.regenAppliedPercent); else RenderMissing(t.rearOutputAgeMs);
+        if (t.rearOutputOnline) ImGui::TextColored(t.regenReady ? COLOR_OK_GREEN : COLOR_WARN_AMBER, "%s", t.regenReady ? "준비" : "검증 대기");
         ImGui::EndTable();
     }
 
@@ -332,8 +360,8 @@ void DashboardUI::UpdateGnssTrail(const EVTelemetry& t) {
 }
 
 void DashboardUI::RenderGnss(const EVTelemetry& t, bool connected) {
-    ImGui::SetNextWindowPos(ImVec2(16, 302), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(360, 560), ImGuiCond_Once);
+    ImGui::SetNextWindowPos(ImVec2(16, 337), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(360, 525), ImGuiCond_Once);
     ImGui::Begin("GNSS 트랙맵", &showGnssWindow_, ImGuiWindowFlags_NoCollapse);
 
     const bool live = connected && t.gnssOnline && t.gnssAgeMs < 2000.0f;

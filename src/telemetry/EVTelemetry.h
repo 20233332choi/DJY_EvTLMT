@@ -7,28 +7,45 @@
 struct EVTelemetry {
     std::uint32_t sequence = 0;
     std::uint32_t timestampMs = 0;
+    bool vehicleOnline = false;
+    float vehicleAgeMs = -1.0f;
 
     float speedKmh = 0.0f;
+    bool speedOnline = false;
+    float speedAgeMs = -1.0f;
     std::uint16_t rpmLeft = 0;
     std::uint16_t rpmRight = 0;
+    bool motorLeftOk = false;
+    bool motorRightOk = false;
+    bool rpmLeftOnline = false;
+    bool rpmRightOnline = false;
+    float rpmLeftAgeMs = -1.0f;
+    float rpmRightAgeMs = -1.0f;
     std::uint32_t captureLeft = 0;
     std::uint32_t captureRight = 0;
 
     std::uint16_t tpsRaw = 0;
     float tpsPercent = 0.0f;
     bool tpsOk = false;
+    bool tpsOnline = false;
+    float tpsAgeMs = -1.0f;
     std::uint16_t sasRaw = 0;
     std::uint16_t sasCenterRaw = 8192;
     float sasAbsoluteDeg = 0.0f;
     float sasRelativeDeg = 0.0f;
     float steeringDeg = 0.0f;
     bool sasOk = false;
+    bool sasOnline = false;
+    float sasAgeMs = -1.0f;
     bool frontSensorOnline = false;
     bool frontDirectOnline = false;
     float frontDirectAgeMs = 0.0f;
     char frontSource[32] = "CAN / ESP";
     float yawRateRadS = 0.0f;
     float lateralAccelMS2 = 0.0f;
+    bool imuOk = false;
+    bool imuOnline = false;
+    float imuAgeMs = -1.0f;
 
     // Reserved for a real GNSS receiver. The dashboard never generates
     // synthetic coordinates when this input is absent.
@@ -47,6 +64,8 @@ struct EVTelemetry {
     float powerLeftKw = 0.0f;
     float powerRightKw = 0.0f;
     float deltaPowerKw = 0.0f;
+    bool rearOutputOnline = false;
+    float rearOutputAgeMs = -1.0f;
 
     float batterySocPercent = 0.0f;
     float batteryPackVoltageV = 0.0f;

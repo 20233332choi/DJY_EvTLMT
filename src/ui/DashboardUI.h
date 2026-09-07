@@ -55,7 +55,7 @@ private:
     void ApplyTheme();
     void UpdateGnssTrail(const EVTelemetry& telemetry);
     void RenderSystemStatus(IDataSource* source, const EVTelemetry& telemetry);
-    void RenderVehicle(const EVTelemetry& telemetry, bool connected);
+    void RenderVehicle(const EVTelemetry& telemetry);
     void RenderBattery(const EVTelemetry& telemetry, bool connected);
     void RenderGnss(const EVTelemetry& telemetry, bool connected);
     void RenderControl(const EVTelemetry& telemetry, bool connected);

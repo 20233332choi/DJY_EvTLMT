@@ -495,19 +495,84 @@ class DisplayTestState:
 
 
 class TelemetryStore:
+    VEHICLE_INPUTS = (
+        "stm_online", "can_ok", "fault_code", "fault", "drive_mode",
+        "speed_kmh", "speed", "rpm_left", "rpm_l", "rpm_right", "rpm_r", "tps_raw", "tps_pct",
+        "throttle_pct", "sas_raw", "sas_deg", "steering_deg", "yaw_rate_rad_s", "yaw_rate",
+        "lateral_accel_m_s2", "lat_accel", "dac_left", "dac_right", "tv_applied_pct",
+    )
+    SIGNAL_GROUPS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+        "speed": (("speed_kmh", "speed"), ("speed_kmh",)),
+        "rpm_left": (
+            ("rpm_left", "rpm_l", "cap_left", "capture_left", "motor_left_ok"),
+            ("rpm_left", "cap_left", "motor_left_ok"),
+        ),
+        "rpm_right": (
+            ("rpm_right", "rpm_r", "cap_right", "capture_right", "motor_right_ok"),
+            ("rpm_right", "cap_right", "motor_right_ok"),
+        ),
+        "tps": (
+            ("tps_raw", "tps_pct", "throttle_pct", "tps_ok"),
+            ("tps_raw", "tps_pct", "tps_ok"),
+        ),
+        "sas": (
+            ("sas_raw", "sas_deg", "steering_deg", "sas_absolute_deg", "sas_abs_deg",
+             "sas_relative_deg", "sas_sensor_deg", "sas_center_raw", "sas_ok"),
+            ("sas_raw", "sas_center_raw", "sas_absolute_deg", "sas_relative_deg", "sas_deg", "sas_ok"),
+        ),
+        "imu": (
+            ("yaw_rate_rad_s", "yaw_rate", "lateral_accel_m_s2", "lat_accel", "imu_ok"),
+            ("yaw_rate_rad_s", "lateral_accel_m_s2", "imu_ok"),
+        ),
+        "rear_output": (
+            ("dac_left", "dac_l", "dac_right", "dac_r", "power_left_kw", "power_right_kw",
+             "delta_power_kw", "tv_requested_pct", "tv_applied_pct", "regen_requested_pct",
+             "regen_applied_pct", "rear_status_seq"),
+            ("dac_left", "dac_right", "power_left_kw", "power_right_kw", "delta_power_kw",
+             "tv_requested_pct", "tv_applied_pct", "regen_requested_pct", "regen_applied_pct",
+             "rear_status_seq", "tv_active", "regen_ready", "regen_active", "tv_limited", "regen_limited"),
+        ),
+        "bms": (
+            ("battery_soc_pct", "soc_pct", "battery_pct", "battery_pack_voltage_v", "pack_voltage_v",
+             "battery_current_a", "pack_current_a", "bms_cell_voltages_v", "bms_online", "bms_ok"),
+            tuple(name for name in normalize_packet({}) if name.startswith("bms_") or name.startswith("battery_")),
+        ),
+        "gnss": (
+            ("gnss_online", "gps_online", "gnss_fix_type", "fix_type", "gnss_latitude_deg", "latitude",
+             "gnss_longitude_deg", "longitude", "gnss_satellites", "satellites"),
+            tuple(name for name in normalize_packet({}) if name.startswith("gnss_")),
+        ),
+    }
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._packet: dict[str, Any] = normalize_packet({})
         self._last_monotonic: float | None = None
+        self._vehicle_last_monotonic: float | None = None
         self._received = 0
         self._lost = 0
         self._last_seq = 0
         self._arrivals: list[float] = []
+        self._signal_last: dict[str, float] = {}
+        self._signal_reported_online: dict[str, bool] = {}
 
     def update(self, data: Mapping[str, Any], now: float | None = None) -> dict[str, Any]:
         timestamp = time.monotonic() if now is None else now
-        packet = normalize_packet(data)
+        normalized = normalize_packet(data)
         with self._lock:
+            packet = dict(normalized)
+            for group, (input_names, output_names) in self.SIGNAL_GROUPS.items():
+                present = any(name in data for name in input_names)
+                if present:
+                    self._signal_last[group] = timestamp
+                    online_key = f"{group}_online"
+                    self._signal_reported_online[group] = (
+                        bool(data[online_key]) if online_key in data else True
+                    )
+                else:
+                    for name in output_names:
+                        if name in self._packet:
+                            packet[name] = self._packet[name]
             sequence = int(packet["seq"])
             if sequence and self._last_seq and sequence > self._last_seq + 1:
                 self._lost += sequence - self._last_seq - 1
@@ -515,6 +580,8 @@ class TelemetryStore:
                 self._last_seq = sequence
             self._received += 1
             self._last_monotonic = timestamp
+            if any(name in data for name in self.VEHICLE_INPUTS):
+                self._vehicle_last_monotonic = timestamp
             self._arrivals.append(timestamp)
             cutoff = timestamp - 2.0
             self._arrivals = [arrival for arrival in self._arrivals if arrival >= cutoff]
@@ -524,16 +591,32 @@ class TelemetryStore:
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
         timestamp = time.monotonic() if now is None else now
         with self._lock:
-            age = None if self._last_monotonic is None else max(0.0, timestamp - self._last_monotonic)
+            age = None if self._vehicle_last_monotonic is None else max(0.0, timestamp - self._vehicle_last_monotonic)
             rate = 0.0
             if len(self._arrivals) > 1:
                 span = self._arrivals[-1] - self._arrivals[0]
                 if span > 0:
                     rate = (len(self._arrivals) - 1) / span
             result = dict(self._packet)
+            for group in self.SIGNAL_GROUPS:
+                last = self._signal_last.get(group)
+                signal_age = None if last is None else max(0.0, timestamp - last)
+                reported_age = result.get(f"{group}_age_ms", 0.0)
+                if not isinstance(reported_age, (int, float)):
+                    reported_age = 0.0
+                age_ms = None if signal_age is None else max(float(reported_age), signal_age * 1000.0)
+                limit_ms = 3000.0 if group == "bms" else 2000.0 if group == "gnss" else 1500.0
+                result[f"{group}_online"] = (
+                    age_ms is not None
+                    and age_ms < limit_ms
+                    and self._signal_reported_online.get(group, True)
+                )
+                result[f"{group}_age_ms"] = None if age_ms is None else round(age_ms, 1)
             result.update(
                 {
                     "online": age is not None and age < 1.5,
+                    "vehicle_online": age is not None and age < 1.5,
+                    "vehicle_age_ms": None if age is None else round(age * 1000.0, 1),
                     "age_ms": None if age is None else round(age * 1000.0, 1),
                     "received_packets": self._received,
                     "lost_packets": self._lost,
@@ -664,6 +747,12 @@ class EVGateway:
             result["front_direct_age_ms"] = round(front_age * 1000.0, 1)
             if front_fresh:
                 result.update(front_state)
+                if any(name in front_state for name in ("tps_raw", "tps_pct", "tps_ok")):
+                    result["tps_online"] = True
+                    result["tps_age_ms"] = round(front_age * 1000.0, 1)
+                if any(name in front_state for name in ("sas_raw", "sas_deg", "sas_ok")):
+                    result["sas_online"] = True
+                    result["sas_age_ms"] = round(front_age * 1000.0, 1)
         with self.bms_lock:
             bms_state = dict(self.bms_state)
             bms_last = self.bms_last_monotonic

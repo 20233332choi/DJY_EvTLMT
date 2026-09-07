@@ -137,13 +137,52 @@ class EVGatewayTests(unittest.TestCase):
 
     def test_store_reports_loss_and_stale(self):
         store = TelemetryStore()
-        store.update({"seq": 10}, now=1.0)
-        store.update({"seq": 13}, now=1.1)
+        store.update({"seq": 10, "stm_online": True}, now=1.0)
+        store.update({"seq": 13, "stm_online": True}, now=1.1)
         live = store.snapshot(now=1.2)
         stale = store.snapshot(now=3.0)
         self.assertEqual(live["lost_packets"], 2)
         self.assertTrue(live["online"])
         self.assertFalse(stale["online"])
+
+    def test_store_merges_partial_packets_and_tracks_each_signal_age(self):
+        store = TelemetryStore()
+        store.update({"seq": 1, "rpm_left": 3100, "tps_pct": 24.0}, now=1.0)
+        store.update({"seq": 2, "rpm_right": 3200, "yaw_rate_rad_s": 0.2}, now=1.8)
+
+        both_fresh = store.snapshot(now=2.0)
+        self.assertEqual(both_fresh["rpm_left"], 3100)
+        self.assertEqual(both_fresh["rpm_right"], 3200)
+        self.assertTrue(both_fresh["rpm_left_online"])
+        self.assertTrue(both_fresh["rpm_right_online"])
+        self.assertTrue(both_fresh["tps_online"])
+        self.assertTrue(both_fresh["imu_online"])
+        self.assertFalse(both_fresh["sas_online"])
+        self.assertIsNone(both_fresh["sas_age_ms"])
+
+        independently_stale = store.snapshot(now=2.6)
+        self.assertFalse(independently_stale["rpm_left_online"])
+        self.assertFalse(independently_stale["tps_online"])
+        self.assertTrue(independently_stale["rpm_right_online"])
+        self.assertTrue(independently_stale["imu_online"])
+
+    def test_fresh_bms_does_not_make_stale_vehicle_online(self):
+        gateway = EVGateway("127.0.0.1", 9003, "127.0.0.1", 9004)
+        try:
+            gateway.store.update({"seq": 1, "rpm_left": 1234}, now=time.monotonic() - 2.0)
+            gateway.store.update({"battery_soc_pct": 71.0, "bms_online": True})
+            with gateway.bms_lock:
+                gateway.bms_configured = True
+                gateway.bms_last_monotonic = time.monotonic()
+                gateway.bms_state = {"battery_soc_pct": 72.0, "bms_fault": False}
+
+            snapshot = gateway.snapshot()
+            self.assertFalse(snapshot["vehicle_online"])
+            self.assertFalse(snapshot["rpm_left_online"])
+            self.assertTrue(snapshot["bms_online"])
+            self.assertEqual(snapshot["battery_soc_pct"], 72.0)
+        finally:
+            gateway.forward_socket.close()
 
     def test_display_test_overrides_are_isolated(self):
         state = DisplayTestState()
