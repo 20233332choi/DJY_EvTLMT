@@ -10,3 +10,6 @@ __pycache__/
 *.pyc
 /data/dummy/*.log
 !/data/dummy/.gitkeep
+/.local/
+firmware/esp32_ev_gateway/include/config.h
+.pio/

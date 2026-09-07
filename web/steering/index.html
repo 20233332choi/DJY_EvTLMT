@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+  <title>DJY EV DRIVER</title>
+  <style>
+    :root { color-scheme:dark; --black:#000; --panel:#080808; --line:#686868; --white:#fff; --muted:#b8b8b8; --green:#00ff5a; --yellow:#fff200; --red:#ff1738; --orange:#ff8a00; }
+    * { box-sizing:border-box; }
+    html,body { width:100%; height:100%; margin:0; overflow:hidden; background:var(--black); color:var(--white); font-family:Arial,Helvetica,sans-serif; }
+    body { padding:max(4px,env(safe-area-inset-top)) max(4px,env(safe-area-inset-right)) max(4px,env(safe-area-inset-bottom)) max(4px,env(safe-area-inset-left)); }
+    .display { position:relative; width:100%; height:100%; display:grid; grid-template-rows:22px 18px minmax(0,1fr) auto; gap:5px; padding:7px; border:3px solid var(--white); background:var(--black); }
+    .leds { display:grid; grid-template-columns:repeat(16,1fr); gap:4px; }
+    .led { border:2px solid #585858; background:#111; }
+    .led.on.green { border-color:var(--green); background:var(--green); }
+    .led.on.yellow { border-color:var(--yellow); background:var(--yellow); }
+    .led.on.red { border-color:var(--red); background:var(--red); }
+    header { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; color:var(--muted); font:900 clamp(8px,1.3vw,12px)/1 Consolas,monospace; letter-spacing:.1em; }
+    .test { display:none; color:var(--yellow); text-align:center; } .test.show { display:block; }
+    .link { justify-self:end; color:var(--red); } .link.live { color:var(--green); }
+    .main { min-height:0; display:grid; grid-template-columns:minmax(52px,.55fr) minmax(105px,.95fr) minmax(230px,1.8fr) minmax(105px,.95fr) minmax(52px,.55fr); gap:5px; }
+    .box { min-width:0; border:2px solid var(--line); background:var(--black); }
+    .rpm-gauge { min-height:0; display:grid; grid-template-rows:auto auto 1fr; gap:4px; padding:6px; text-align:center; }
+    .rpm-gauge label,.lap-card label,.speed label,.battery label { color:var(--muted); font:900 clamp(8px,1.2vw,11px)/1 Consolas,monospace; letter-spacing:.08em; }
+    .rpm-gauge strong { color:var(--white); font:900 clamp(14px,2.4vw,24px)/1 "Arial Narrow",Arial,sans-serif; }
+    .vbar { min-height:0; position:relative; border:2px solid var(--white); background:#050505; }
+    .vbar i { position:absolute; left:0; right:0; bottom:0; height:0; background:var(--green); transition:height .05s linear; }
+    .vbar i.mid { background:var(--yellow); } .vbar i.high { background:var(--red); }
+    .lap-card { display:flex; flex-direction:column; align-items:center; justify-content:center; padding:6px; text-align:center; }
+    .lap-card strong { margin-top:10px; color:var(--white); font:900 clamp(27px,4.6vw,48px)/1 Consolas,monospace; letter-spacing:-.08em; white-space:nowrap; }
+    .lap-card.best { border-color:var(--green); } .lap-card.best strong { color:var(--green); }
+    .lap-card.last { border-color:var(--yellow); } .lap-card.last strong { color:var(--yellow); }
+    .center { min-height:0; display:grid; grid-template-rows:minmax(0,1fr) 70px; gap:5px; }
+    .speed { position:relative; display:flex; align-items:center; justify-content:center; border-color:var(--white); }
+    .speed label { position:absolute; left:7px; top:6px; }
+    .speed strong { color:var(--white); font:900 clamp(82px,17vw,170px)/.8 "Arial Narrow",Arial,sans-serif; letter-spacing:-.06em; }
+    .speed small { position:absolute; right:7px; bottom:5px; color:var(--white); font:900 clamp(9px,1.3vw,12px) Consolas,monospace; }
+    .battery { display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:9px; padding:7px; border-color:var(--white); }
+    .battery strong { color:var(--white); font:900 clamp(22px,4vw,38px)/1 Arial,sans-serif; }
+    .soc { height:24px; border:2px solid var(--white); background:#050505; }
+    .soc i { display:block; width:0; height:100%; background:var(--green); transition:width .1s linear; }
+    .soc i.low { background:var(--yellow); } .soc i.critical { background:var(--red); animation:valueblink .45s step-end infinite; }
+    .systems { display:grid; grid-template-rows:28px 46px; gap:5px; }
+    .sensors { display:grid; grid-template-columns:repeat(8,1fr); gap:4px; }
+    .sensor { display:flex; align-items:center; justify-content:center; border:2px solid var(--line); color:var(--red); background:var(--black); font:900 clamp(7px,1.05vw,10px)/1 Consolas,monospace; }
+    .sensor.ok { border-color:var(--green); color:var(--green); }
+    .sensor.warn { border-color:var(--red); color:var(--red); animation:valueblink .55s step-end infinite; }
+    .controls { display:grid; grid-template-columns:1.25fr .65fr .65fr 1fr; gap:5px; }
+    .tv,.setting-card,.modes { border:2px solid var(--line); background:var(--black); padding:5px; }
+    .tv { display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:7px; }
+    .tv label,.modes label { color:var(--muted); font:900 9px/1 Consolas,monospace; letter-spacing:.08em; }
+    .tv strong { min-width:56px; color:var(--white); font:900 13px/1 Consolas,monospace; text-align:right; }
+    .setting-card { display:flex; flex-direction:column; justify-content:center; text-align:center; }
+    .setting-card label { color:var(--muted); font:900 8px/1 Consolas,monospace; }
+    .setting-card strong { margin-top:4px; color:var(--white); font:900 12px/1 Consolas,monospace; }
+    .setting-card.limited { border-color:var(--yellow); }
+    .diff { position:relative; height:18px; border:2px solid var(--white); background:#050505; }
+    .diff::after { content:""; position:absolute; left:50%; top:-2px; bottom:-2px; width:2px; background:var(--white); }
+    .diff i { position:absolute; top:0; bottom:0; left:50%; width:0; background:var(--orange); }
+    .modes { display:grid; grid-template-columns:auto repeat(4,1fr); align-items:center; gap:4px; }
+    .mode { height:27px; display:flex; align-items:center; justify-content:center; border:2px solid #555; color:#777; font:900 clamp(6px,.85vw,9px)/1 Consolas,monospace; }
+    .mode.active { border-color:var(--white); background:var(--white); color:var(--black); }
+    .alert,.offline { position:absolute; inset:0; z-index:20; display:none; place-items:center; text-align:center; }
+    .alert.show,.offline.show { display:grid; }
+    .alert { --alert-bg:var(--white); --alert-fg:var(--black); background:var(--alert-bg); color:var(--alert-fg); animation:alertblink .42s step-end infinite; }
+    .alert span { max-width:94%; font:900 clamp(46px,12vw,130px)/.86 "Arial Black",Arial,sans-serif; overflow-wrap:anywhere; }
+    .alert small { display:block; margin-top:16px; font:900 clamp(12px,2vw,22px)/1 Consolas,monospace; letter-spacing:.08em; }
+    .alert.green { --alert-bg:var(--green); } .alert.yellow { --alert-bg:var(--yellow); }
+    .alert.red,.alert.stop,.alert.fault { --alert-bg:var(--red); --alert-fg:var(--white); }
+    .alert.box,.alert.adjust,.alert.tqv { --alert-bg:var(--orange); } .alert.checkered { --alert-bg:var(--white); }
+    .alert.mode-qualifying { --alert-bg:var(--yellow); } .alert.mode-race { --alert-bg:var(--white); }
+    .alert.mode-chrg { --alert-bg:var(--green); } .alert.mode-attack { --alert-bg:var(--orange); }
+    .alert.setting { --alert-bg:var(--black); --alert-fg:var(--white); animation:none; }
+    .alert.setting span { font-size:clamp(42px,9vw,95px); line-height:.82; }
+    .alert.setting small { margin-top:20px; color:inherit; font:900 clamp(68px,18vw,190px)/.78 "Arial Black",Arial,sans-serif; letter-spacing:-.055em; }
+    .offline { background:var(--black); color:var(--red); font:900 clamp(42px,10vw,100px)/.9 "Arial Black",Arial,sans-serif; }
+    .offline small { display:block; margin-top:15px; color:var(--white); font:900 clamp(10px,1.7vw,17px) Consolas,monospace; }
+    @keyframes alertblink { 50% { color:var(--black); background:var(--black); } }
+    @keyframes valueblink { 50% { opacity:.15; } }
+    @media(max-width:650px) {
+      .display { grid-template-rows:18px 16px minmax(0,1fr) auto; padding:4px; gap:3px; }
+      .main { grid-template-columns:42px 82px minmax(160px,1.8fr) 82px 42px; gap:3px; }
+      .center { grid-template-rows:minmax(0,1fr) 54px; gap:3px; }
+      .speed strong { font-size:19vw; }
+      .lap-card strong { font-size:5.3vw; }
+      .systems { grid-template-rows:24px 42px; gap:3px; }
+      .controls { gap:3px; }
+      .modes { padding:3px; }
+      .modes label { display:none; }
+      .mode { font-size:6px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="display">
+    <div class="leds" id="leds" aria-label="average motor RPM LEDs"></div>
+    <header><span>DJY EV · DRIVER</span><span class="test" id="test">DISPLAY TEST</span><span class="link" id="link">● OFFLINE</span></header>
+    <section class="main">
+      <div class="rpm-gauge box"><label>RPM L</label><strong id="rpmL">----</strong><div class="vbar"><i id="barL"></i></div></div>
+      <div class="lap-card best box"><label>BEST LAP</label><strong id="bestLap">--:--.---</strong></div>
+      <div class="center">
+        <div class="speed box"><label>SPEED</label><strong id="speed">--</strong><small>km/h</small></div>
+        <div class="battery box"><label>BATTERY</label><div class="soc"><i id="soc"></i></div><strong><span id="battery">--</span>%</strong></div>
+      </div>
+      <div class="lap-card last box"><label>LAST LAP</label><strong id="lastLap">--:--.---</strong></div>
+      <div class="rpm-gauge box"><label>RPM R</label><strong id="rpmR">----</strong><div class="vbar"><i id="barR"></i></div></div>
+    </section>
+    <section class="systems">
+      <div class="sensors"><span class="sensor" id="sStm">STM</span><span class="sensor" id="sCan">FRONT CAN</span><span class="sensor" id="sTps">TPS</span><span class="sensor" id="sSas">SAS</span><span class="sensor" id="sImu">IMU</span><span class="sensor" id="sBms">BMS</span><span class="sensor" id="sMl">RPM L</span><span class="sensor" id="sMr">RPM R</span></div>
+      <div class="controls">
+        <div class="tv"><label>TV BALANCE</label><div class="diff"><i id="tvFill"></i></div><strong id="tvValue">CENTER</strong></div>
+        <div class="setting-card" id="tqvCard"><label>TQV DIAL / APPLIED</label><strong><span id="tqvRequest">--</span> / <span id="tqvApplied">--</span>%</strong></div>
+        <div class="setting-card" id="regenCard"><label>REGEN DIAL / APPLIED</label><strong><span id="regenRequest">--</span> / <span id="regenApplied">--</span>%</strong></div>
+        <div class="modes"><label>MODE</label><span class="mode" data-mode="QUALIFYING">QUALI</span><span class="mode" data-mode="RACE">RACE</span><span class="mode chrg" data-mode="CHRG">CHRG</span><span class="mode attack" data-mode="ATTACK">ATTACK</span></div>
+      </div>
+    </section>
+    <div class="alert" id="alert"><span><b id="alertTitle">YELLOW FLAG</b><small id="alertNote">TRACK HAZARD</small></span></div>
+    <div class="offline" id="offline"><span>TELEMETRY<br>OFFLINE<small>차량 통신을 확인하세요</small></span></div>
+  </main>
+  <script>
+    const $=id=>document.getElementById(id), RPM_MAX=12000;
+    const flags={GREEN:['GREEN FLAG','TRACK CLEAR','green'],YELLOW:['YELLOW FLAG','TRACK HAZARD','yellow'],RED:['RED FLAG','STOP IMMEDIATELY','red'],STOP:['STOP','SESSION STOPPED','stop'],CHECKERED:['CHEQUERED','SESSION FINISHED','checkered'],BOX:['BOX THIS LAP','PIT CALL','box']};
+    const ledRoot=$('leds');
+    const leds=Array.from({length:16},(_,i)=>{const n=document.createElement('i');n.className=`led ${i<9?'green':i<13?'yellow':'red'}`;ledRoot.appendChild(n);return n;});
+    let fetching=false,lastMode=null,lastTqv=null,lastRegen=null,settingAlert=null;
+    function formatLap(value){const n=Number(value);if(!Number.isFinite(n)||n<=0)return'--:--.---';const m=Math.floor(n/60),s=n-m*60;return`${m}:${s.toFixed(3).padStart(6,'0')}`;}
+    function rpmGauge(value,barId){const ratio=Math.max(0,Math.min(1,value/RPM_MAX)),bar=$(barId);bar.style.height=`${ratio*100}%`;bar.className=ratio>=.86?'high':ratio>=.68?'mid':'';return ratio;}
+    function setSensor(id,ok,warn=false){$(id).className=`sensor ${warn?'warn':ok?'ok':''}`;}
+    function showAlert(title,note,kind){$('alertTitle').textContent=title;$('alertNote').textContent=note;$('alert').className=`alert show ${kind}`;}
+    function showSetting(label,value,kind){$('alertTitle').textContent=label;$('alertNote').textContent=value;$('alert').className=`alert show setting ${kind}`;}
+    function queueSetting(label,value,kind){settingAlert={label,value,kind,until:performance.now()+2500};}
+    async function tick(){
+      if(fetching)return;fetching=true;
+      try{
+        const response=await fetch('/api/telemetry',{cache:'no-store'});if(!response.ok)throw new Error();
+        const d=await response.json(),online=!!d.online,rpmL=Math.max(0,Number(d.rpm_left)||0),rpmR=Math.max(0,Number(d.rpm_right)||0),average=(rpmL+rpmR)/2;
+        $('speed').textContent=online?Math.round(Number(d.speed_kmh)||0):'--';$('rpmL').textContent=online?Math.round(rpmL):'----';$('rpmR').textContent=online?Math.round(rpmR):'----';
+        $('bestLap').textContent=formatLap(d.best_lap_s);$('lastLap').textContent=formatLap(d.last_lap_s);
+        const ratioL=rpmGauge(rpmL,'barL'),ratioR=rpmGauge(rpmR,'barR'),ledCount=Math.ceil(Math.max(0,Math.min(1,average/RPM_MAX))*leds.length);leds.forEach((n,i)=>n.classList.toggle('on',i<ledCount));
+        const soc=Math.max(0,Math.min(100,Number(d.battery_soc_pct)||0));$('battery').textContent=online?Math.round(soc):'--';$('soc').style.width=`${soc}%`;$('soc').className=soc<=10?'critical':soc<=25?'low':'';
+        const fault=Number(d.fault_code||0),frontCan=!!d.front_sensor_online&&fault!==1,tpsOk=!!d.tps_ok&&fault!==2,sasOk=!!d.sas_ok&&fault!==5,imuOk=!!d.imu_ok&&fault!==3,rpmOk=fault!==4;
+        setSensor('sStm',!!d.stm_online,!d.stm_online);setSensor('sCan',frontCan,!frontCan);setSensor('sTps',tpsOk,!tpsOk);setSensor('sSas',sasOk,!sasOk);setSensor('sImu',imuOk,!imuOk);setSensor('sBms',!!d.bms_ok,!d.bms_ok);setSensor('sMl',!!d.motor_left_ok&&rpmOk,!d.motor_left_ok||!rpmOk);setSensor('sMr',!!d.motor_right_ok&&rpmOk,!d.motor_right_ok||!rpmOk);
+        const tv=Math.max(-100,Math.min(100,Number(d.tv_percent)||0)),fill=$('tvFill');fill.style.left=tv<0?`${50-Math.abs(tv)/2}%`:'50%';fill.style.width=`${Math.abs(tv)/2}%`;$('tvValue').textContent=Math.abs(tv)<.5?'CENTER':`${tv<0?'L':'R'} ${Math.abs(tv).toFixed(0)}%`;
+        const mode=String(d.drive_mode||'RACE').toUpperCase();document.querySelectorAll('.mode').forEach(n=>n.classList.toggle('active',n.dataset.mode===mode));
+        if(lastMode!==null&&mode!==lastMode)queueSetting('MODE',mode,`mode-${mode.toLowerCase()}`);
+        lastMode=mode;
+        const tqv=Math.max(0,Math.min(100,Number(d.tv_requested_pct??d.tqv_setting_pct)||0)),tqvApplied=Math.max(0,Math.min(100,Number(d.tv_applied_pct)||0));
+        $('tqvRequest').textContent=Math.round(tqv);$('tqvApplied').textContent=Math.round(tqvApplied);$('tqvCard').classList.toggle('limited',!!d.tv_limited);
+        if(lastTqv!==null&&Math.abs(tqv-lastTqv)>=.5)queueSetting('TORQUE V',`${Math.round(tqv)}%`,'tqv');
+        lastTqv=tqv;
+        const regen=Math.max(0,Math.min(100,Number(d.regen_requested_pct)||0)),regenApplied=Math.max(0,Math.min(100,Number(d.regen_applied_pct)||0));
+        $('regenRequest').textContent=Math.round(regen);$('regenApplied').textContent=Math.round(regenApplied);$('regenCard').classList.toggle('limited',!!d.regen_limited);
+        if(lastRegen!==null&&Math.abs(regen-lastRegen)>=.5)queueSetting('REGEN',`${Math.round(regen)}%`,'tqv');
+        lastRegen=regen;
+        $('test').classList.toggle('show',!!d.test_override);$('link').textContent=online?'● LIVE':'● OFFLINE';$('link').className=`link ${online?'live':''}`;
+        const flag=String(d.flag||'CLEAR').toUpperCase(),adjustment=String(d.adjustment_message||'').trim();
+        if(flags[flag])showAlert(...flags[flag]);else if(adjustment)showAlert(adjustment,'SETTING CHANGED','adjust');else if(settingAlert&&performance.now()<settingAlert.until)showSetting(settingAlert.label,settingAlert.value,settingAlert.kind);else $('alert').className='alert';
+        $('offline').classList.toggle('show',!online);
+      }catch(_){$('offline').classList.add('show');$('alert').className='alert';$('link').textContent='● OFFLINE';$('link').className='link';}
+      finally{fetching=false;}
+    }
+    setInterval(tick,50);tick();
+  </script>
+</body>
+</html>

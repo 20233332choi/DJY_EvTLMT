@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#05070a">
+  <title>DJY Driver</title>
+  <style>
+    :root{color-scheme:dark;--bg:#05070a;--card:#10151d;--line:#253142;--muted:#8190a5;--ok:#28e085;--warn:#ffb020;--bad:#ff4057;--cyan:#35c7ff}
+    *{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;overflow:hidden;background:var(--bg);font-family:Arial,"Noto Sans KR",sans-serif;color:#fff}
+    body{padding:max(8px,env(safe-area-inset-top)) max(10px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left))}
+    main{height:100%;display:grid;grid-template-columns:1.18fr 1fr 1fr;grid-template-rows:auto 1fr 1fr;gap:8px}
+    header{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;min-height:30px}.brand{font-weight:900;letter-spacing:.13em}.link{font-weight:900;color:var(--bad)}.link.live{color:var(--ok)}
+    .card{background:linear-gradient(145deg,#121923,#0b1016);border:1px solid var(--line);border-radius:14px;padding:12px;min-width:0;position:relative;overflow:hidden}
+    .label{color:var(--muted);font-weight:800;font-size:clamp(10px,1.5vw,16px);letter-spacing:.08em}.big{font-size:clamp(52px,11vw,124px);font-weight:950;line-height:.88;font-variant-numeric:tabular-nums}.unit{font-size:clamp(13px,2vw,22px);color:var(--muted);font-weight:800}
+    .speed{grid-row:2/4;display:flex;flex-direction:column;justify-content:space-between}.speed .big{color:#fff}.mode{font-size:clamp(17px,2.8vw,32px);font-weight:950;color:var(--cyan)}
+    .pair{display:flex;justify-content:space-between;align-items:end;gap:8px}.value{font-size:clamp(30px,5.5vw,66px);font-weight:950;font-variant-numeric:tabular-nums}.sub{font-size:clamp(12px,1.6vw,18px);color:var(--muted)}
+    .bar{height:16px;border-radius:10px;background:#202a36;overflow:hidden;margin-top:10px}.fill{height:100%;width:0;background:linear-gradient(90deg,var(--cyan),var(--ok));transition:width .08s linear}
+    .tqv .value{color:var(--ok)}.limit{color:var(--warn)}.status-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:7px;margin-top:8px}.pill{border:1px solid var(--line);border-radius:8px;padding:7px;text-align:center;font-weight:900;color:var(--bad)}.pill.ok{color:var(--ok);border-color:#1b6648}
+    #fault{display:none;position:fixed;inset:0;background:#c50020e8;z-index:20;align-items:center;justify-content:center;text-align:center;font-weight:950;font-size:clamp(42px,10vw,110px)}#fault.show{display:flex}
+    #offline{display:none;position:fixed;inset:0;background:#05070ae8;z-index:19;align-items:center;justify-content:center;text-align:center;font-size:clamp(32px,8vw,82px);font-weight:950;color:var(--bad)}#offline.show{display:flex}
+    #full{position:fixed;right:8px;bottom:8px;z-index:30;border:1px solid #34445a;background:#101722;color:#aebbd0;border-radius:8px;padding:7px 10px;font-weight:800}
+    @media(orientation:portrait){main{grid-template-columns:1fr 1fr;grid-template-rows:auto 1.2fr 1fr 1fr}.speed{grid-column:1/-1;grid-row:2}.card{padding:10px}.big{font-size:clamp(70px,25vw,140px)}}
+  </style>
+</head>
+<body>
+  <main>
+    <header><div class="brand">DJY DRIVER</div><div id="link" class="link">● OFFLINE</div></header>
+    <section class="card speed"><div><div class="label">SPEED</div><div><span id="speed" class="big">0</span> <span class="unit">km/h</span></div></div><div class="mode" id="mode">RACE</div></section>
+    <section class="card"><div class="label">MOTOR RPM</div><div class="pair"><div><div class="sub">LEFT</div><div id="rpmL" class="value">0</div></div><div style="text-align:right"><div class="sub">RIGHT</div><div id="rpmR" class="value">0</div></div></div></section>
+    <section class="card tqv"><div class="label">TORQUE VECTORING</div><div class="pair"><div><div class="sub">REQUEST</div><div class="value"><span id="request">0</span><span class="unit">%</span></div></div><div style="text-align:right"><div class="sub">APPLIED / LIMIT</div><div class="value"><span id="applied">0</span><span class="unit"> / </span><span id="limit" class="limit">100</span><span class="unit">%</span></div></div></div></section>
+    <section class="card"><div class="label">THROTTLE</div><div class="value"><span id="tps">0</span><span class="unit">%</span></div><div class="bar"><div id="tpsBar" class="fill"></div></div></section>
+    <section class="card"><div class="label">SYSTEM</div><div class="status-grid"><div id="sStm" class="pill">STM</div><div id="sUart" class="pill">UART</div><div id="sSas" class="pill">SAS</div><div id="sImu" class="pill">IMU</div></div></section>
+  </main>
+  <div id="offline" class="show">TELEMETRY OFFLINE</div><div id="fault">FAULT</div><button id="full">전체화면</button>
+  <script>
+    const $=id=>document.getElementById(id);let busy=false;
+    function pill(id,ok){$(id).classList.toggle('ok',!!ok)}
+    async function update(){if(busy)return;busy=true;try{const r=await fetch('/api/telemetry',{cache:'no-store'});if(!r.ok)throw 0;const d=await r.json();const live=!!d.online&&!!d.stm_online;$('offline').classList.toggle('show',!live);$('link').textContent=live?'● LIVE':'● OFFLINE';$('link').className='link'+(live?' live':'');$('speed').textContent=Math.round(Number(d.speed_kmh)||0);$('rpmL').textContent=Math.round(Number(d.rpm_left)||0);$('rpmR').textContent=Math.round(Number(d.rpm_right)||0);const t=Math.max(0,Math.min(100,Number(d.tps_pct)||0));$('tps').textContent=Math.round(t);$('tpsBar').style.width=t+'%';$('request').textContent=Math.round(Number(d.tv_requested_pct)||0);$('applied').textContent=Math.round(Number(d.tv_applied_pct)||0);$('limit').textContent=Math.round(Number(d.tv_limit_pct)||0);$('mode').textContent=String(d.drive_mode||'RACE');pill('sStm',d.stm_online);pill('sUart',d.uart_ok);pill('sSas',d.sas_ok);pill('sImu',d.imu_ok);const f=Number(d.fault_code)||0;$('fault').textContent='FAULT '+f;$('fault').classList.toggle('show',f>0);}catch(e){$('offline').classList.add('show')}finally{busy=false}}
+    $('full').onclick=async()=>{try{await document.documentElement.requestFullscreen();if(navigator.wakeLock)await navigator.wakeLock.request('screen');$('full').style.display='none'}catch(e){}};
+    setInterval(update,100);update();
+  </script>
+</body>
+</html>

@@ -1,59 +1,67 @@
 #pragma once
-#include "imgui.h"
+
 #include "DataSource.h"
 #include "EnergyLog.h"
-#include "VirtualLogRecorder.h"
+#include "EVTelemetry.h"
+#include "imgui.h"
+
+#include <cstdint>
 #include <deque>
 
-// --- Constants & Themes ---
-const ImVec4 COLOR_FERRARI_RED = ImVec4(0.89f, 0.15f, 0.21f, 1.0f);
-const ImVec4 COLOR_F1_YELLOW   = ImVec4(1.00f, 0.95f, 0.00f, 1.0f);
-const ImVec4 COLOR_F1_CYAN     = ImVec4(0.00f, 0.82f, 0.75f, 1.0f);
-const ImVec4 COLOR_F1_GREEN    = ImVec4(0.00f, 1.00f, 0.00f, 1.0f);
-const ImVec4 COLOR_F1_PURPLE   = ImVec4(0.72f, 0.00f, 0.72f, 1.0f);
-
-struct SectorData {
-    float lastTime[3] = {0, 0, 0};
-    float personalBest[3] = {999, 999, 999};
-    float sessionBest[3] = {999, 999, 999};
-    ImVec4 colors[3] = {ImVec4(0.5f, 0.5f, 0.5f, 1), ImVec4(0.5f, 0.5f, 0.5f, 1), ImVec4(0.5f, 0.5f, 0.5f, 1)};
-};
+inline const ImVec4 COLOR_ALERT_RED  = ImVec4(0.94f, 0.22f, 0.25f, 1.0f);
+inline const ImVec4 COLOR_WARN_AMBER = ImVec4(1.00f, 0.70f, 0.12f, 1.0f);
+inline const ImVec4 COLOR_INFO_CYAN  = ImVec4(0.15f, 0.78f, 0.88f, 1.0f);
+inline const ImVec4 COLOR_OK_GREEN   = ImVec4(0.20f, 0.84f, 0.47f, 1.0f);
+inline const ImVec4 COLOR_MUTED      = ImVec4(0.58f, 0.62f, 0.68f, 1.0f);
 
 class DashboardUI {
-private:
-    bool showTyreWin = true;
-    bool showMapWin = false;
-    bool showTimingWin = true;
-    bool showDriverInputWin = true;
-    bool showVirtualEnergyWin = true;
-    bool showActualEnergyWin = true;
-    bool showRecordedLogWin = false;
-    SectorData sectorTiming;
-    std::deque<ImVec2> trackTrail;
-    EnergyLog recordedLog;
-    int selectedLogSample = 0;
-    VirtualLogRecorder* virtualRecorder = nullptr;
-
-    void UpdateSectorTiming(int sectorIndex, int lastSectorTime);
-    ImVec4 GetTempColor(float temp);
-    
-    void ApplyF1Theme();
-
 public:
-    bool enableWebBroadcast = false;
-
     DashboardUI();
-    ~DashboardUI() = default;
+    ~DashboardUI();
 
-    void Render(IDataSource* dataSource, bool& outDemoMode);
-    
-    void RenderCommander(IDataSource* dataSource, bool& outDemoMode);
-    void RenderTyreMonitor(SPageFilePhysics* physics);
-    void RenderTiming(SPageFileGraphics* graphics);
-    void RenderTrackMap(SPageFilePhysics* physics);
-    void RenderEnergyMeter(SPageFilePhysics* physics, const char* sourceName);
-    void RenderActualEnergyMeter();
-    void RenderDriverInputs(SPageFilePhysics* physics, bool isVirtual);
+    void Render(IDataSource* dataSource);
+
+private:
+    bool showVehicleWindow_ = true;
+    bool showBatteryWindow_ = true;
+    bool showGnssWindow_ = true;
+    bool showControlWindow_ = false;
+    bool showRecordedLogWindow_ = false;
+
+    bool evControlInitialized_ = false;
+    float stagedTvStrength_ = 0.0f;
+    bool stagedLiveTvEnable_ = false;
+    bool liveCommandArmed_ = false;
+    float activeLiveTvStrength_ = 0.0f;
+    float activeLiveTvLimit_ = 100.0f;
+    double lastLiveHeartbeatTime_ = 0.0;
+    float stagedTvLimit_ = 100.0f;
+    float stagedRegenLimit_ = 0.0f;
+    int stagedTvRamp_ = 200;
+    int stagedRegenRamp_ = 50;
+    bool stagedTvEnable_ = true;
+    bool stagedRegenEnable_ = false;
+    std::uint32_t controlRequestId_ = 0;
+    char localControlStatus_[128] = "전송한 명령 없음";
+
+    bool gnssOriginValid_ = false;
+    double gnssOriginLatitude_ = 0.0;
+    double gnssOriginLongitude_ = 0.0;
+    std::deque<ImVec2> gnssTrailMeters_;
+
+    EnergyLog recordedLog_;
+    int selectedLogSample_ = 0;
+
+    void ApplyTheme();
+    void UpdateGnssTrail(const EVTelemetry& telemetry);
+    void RenderSystemStatus(IDataSource* source, const EVTelemetry& telemetry);
+    void RenderVehicle(const EVTelemetry& telemetry, bool connected);
+    void RenderBattery(const EVTelemetry& telemetry, bool connected);
+    void RenderGnss(const EVTelemetry& telemetry, bool connected);
+    void RenderControl(const EVTelemetry& telemetry, bool connected);
     void RenderRecordedLog();
-    void SetVirtualRecorder(VirtualLogRecorder* recorder) { virtualRecorder = recorder; }
+
+    bool SendEVRelayPing();
+    bool SendEVControlRequest();
+    bool SendEVLiveControlRequest(bool neutral, bool heartbeat = false);
 };

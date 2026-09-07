@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DJY EV Display Test</title>
+  <style>
+    :root { color-scheme:dark; --bg:#050708; --panel:#0d1215; --line:#354149; --text:#eef2f4; --muted:#8b979e; --green:#24ef8f; --yellow:#ffe02d; --orange:#ff851b; --red:#ff2e49; --cyan:#32dcff; }
+    * { box-sizing:border-box; }
+    body { max-width:980px; margin:0 auto; padding:22px; background:var(--bg); color:var(--text); font-family:Consolas,"Segoe UI",sans-serif; }
+    header { display:flex; justify-content:space-between; align-items:center; gap:15px; margin-bottom:18px; }
+    h1 { margin:0; font-size:24px; } header a { color:var(--cyan); }
+    .warning { margin-bottom:18px; padding:10px 13px; border:1px solid var(--yellow); color:var(--yellow); font-size:12px; }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+    section { padding:15px; border:1px solid var(--line); background:var(--panel); }
+    h2 { margin:0 0 12px; color:var(--muted); font-size:13px; letter-spacing:.1em; }
+    .buttons { display:flex; flex-wrap:wrap; gap:8px; }
+    button { min-height:42px; padding:8px 14px; border:1px solid #59646b; background:#080b0d; color:#fff; font:800 12px Consolas,monospace; cursor:pointer; }
+    button:hover { filter:brightness(1.5); }
+    .green { border-color:var(--green); color:var(--green); } .yellow { border-color:var(--yellow); color:var(--yellow); }
+    .red { border-color:var(--red); color:var(--red); } .orange { border-color:var(--orange); color:var(--orange); }
+    .checkered { color:#000; background:#fff; }
+    label { display:grid; grid-template-columns:80px 1fr 58px; align-items:center; gap:10px; margin:10px 0; color:var(--muted); font-size:12px; }
+    input[type=range] { width:100%; accent-color:var(--cyan); } output { color:#fff; text-align:right; }
+    input[type=text] { width:100%; height:42px; padding:0 10px; border:1px solid #59646b; background:#050708; color:#fff; }
+    .message-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
+    pre { min-height:72px; margin:14px 0 0; padding:12px; overflow:auto; border:1px solid var(--line); background:#020304; color:var(--green); font:11px/1.4 Consolas,monospace; }
+    .wide { grid-column:1/-1; }
+    @media(max-width:700px) { .grid { grid-template-columns:1fr; } .wide { grid-column:auto; } header { align-items:flex-start; flex-direction:column; } }
+  </style>
+</head>
+<body>
+  <header><div><h1>DJY EV 차량 화면 테스트</h1><small>RPM · 배터리 · 랩타임 · 플래그/조정 메시지</small></div><a href="/driver" target="_blank">차량 화면 열기 ↗</a></header>
+  <div class="warning">이 페이지는 표시 시험만 수행합니다. STM·인버터·TV 제어값으로 전송하지 않습니다.</div>
+  <main class="grid">
+    <section><h2>플래그 발령</h2><div class="buttons"><button class="green" data-flag="GREEN">GREEN</button><button class="yellow" data-flag="YELLOW">YELLOW</button><button class="red" data-flag="RED">RED</button><button class="red" data-flag="STOP">STOP</button><button class="checkered" data-flag="CHECKERED">CHEQUERED</button><button class="orange" data-flag="BOX">BOX</button><button data-action="clear_alert">CLEAR</button></div></section>
+    <section><h2>랩타임</h2><div class="buttons"><button class="green" data-action="lap_start">LAP START</button><button class="yellow" data-action="lap_finish">LAP FINISH</button><button data-action="lap_reset">RESET</button></div></section>
+    <section><h2>표시값</h2><label><span>RPM</span><input id="rpm" type="range" min="0" max="12000" step="100" value="4000"><output id="rpmOut">4000</output></label><div class="buttons"><button id="setRpm">RPM 적용</button><button data-rpm="0">0</button><button data-rpm="6000">6000</button><button data-rpm="10000">10000</button></div><label><span>TPS→RPM</span><input id="autoRpmMax" type="range" min="1000" max="20000" step="500" value="12000"><output id="autoRpmMaxOut">12000</output></label><div class="buttons"><button class="green" id="startAutoRpm">TPS 연동 시작</button><button class="red" id="stopAutoRpm">TPS 연동 종료</button></div><label><span>배터리</span><input id="battery" type="range" min="0" max="100" step="1" value="75"><output id="batteryOut">75%</output></label><div class="buttons"><button id="setBattery">SOC 적용</button><button data-battery="100">100%</button><button data-battery="25">25%</button><button data-battery="10">10%</button></div></section>
+    <section><h2>조정 값 알림 · 4초간 점멸</h2><div class="buttons"><button class="orange" data-adjust="TV GAIN +1">TV GAIN +1</button><button class="orange" data-adjust="TV GAIN -1">TV GAIN -1</button><button class="orange" data-adjust="REGEN +1">REGEN +1</button><button class="orange" data-adjust="REGEN -1">REGEN -1</button></div><div class="message-row" style="margin-top:10px"><input id="custom" type="text" maxlength="48" placeholder="예: POWER MAP 2"><button id="sendCustom">보내기</button></div></section>
+    <section><h2>드라이빙 모드 · TQV 강도</h2><div class="buttons"><button data-mode="QUALIFYING">QUALIFYING</button><button data-mode="RACE">RACE</button><button class="green" data-mode="CHRG">CHRG</button><button class="orange" data-mode="ATTACK">ATTACK</button></div><label><span>TQV 강도</span><input id="tqv" type="range" min="0" max="100" step="1" value="40"><output id="tqvOut">40%</output></label><div class="buttons"><button id="setTqv">TQV 적용</button><button data-tqv="0">0%</button><button data-tqv="25">25%</button><button data-tqv="50">50%</button><button data-tqv="100">100%</button></div></section>
+    <section><h2>센서 상태</h2><div class="buttons"><button class="green" id="allSensors">ALL OK</button><button class="red" data-sensor="can_ok">CAN FAIL</button><button class="red" data-sensor="bms_ok">BMS FAIL</button><button class="red" data-sensor="imu_ok">IMU FAIL</button><button class="red" data-sensor="motor_left_ok">MOTOR L FAIL</button><button class="red" data-sensor="motor_right_ok">MOTOR R FAIL</button></div></section>
+    <section class="wide"><h2>상태</h2><div class="buttons"><button data-action="clear_overrides">모든 테스트 해제</button><button id="refresh">새로고침</button></div><pre id="status">대기 중...</pre></section>
+  </main>
+  <script>
+    const $=id=>document.getElementById(id);
+    async function send(action,value,extra={}) {
+      const response=await fetch('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,value,...extra})});
+      const data=await response.json(); if(!response.ok) throw new Error(data.error||`HTTP ${response.status}`); await refresh();
+    }
+    async function refresh() { try { const d=await fetch('/api/telemetry',{cache:'no-store'}).then(r=>r.json()); $('status').textContent=JSON.stringify({online:d.online,tps_pct:d.tps_pct,rpm_left:d.rpm_left,rpm_right:d.rpm_right,rpm_test_mode:d.rpm_test_mode||'OFF',rpm_test_max:d.rpm_test_max||0,fault_code:d.fault_code,battery_soc_pct:d.battery_soc_pct,best_lap_s:d.best_lap_s,last_lap_s:d.last_lap_s,lap_time_s:d.lap_time_s,drive_mode:d.drive_mode,tqv_setting_pct:d.tqv_setting_pct,tv_percent:d.tv_percent,sensors:{stm:d.stm_online,can:d.can_ok,sas:d.sas_ok,imu:d.imu_ok,bms:d.bms_ok,motor_left:d.motor_left_ok,motor_right:d.motor_right_ok},flag:d.flag,adjustment_message:d.adjustment_message,test_override:d.test_override},null,2); } catch(e) { $('status').textContent=`ERROR: ${e.message}`; } }
+    $('rpm').oninput=()=>$('rpmOut').textContent=$('rpm').value; $('autoRpmMax').oninput=()=>$('autoRpmMaxOut').textContent=$('autoRpmMax').value; $('battery').oninput=()=>$('batteryOut').textContent=`${$('battery').value}%`; $('tqv').oninput=()=>$('tqvOut').textContent=`${$('tqv').value}%`;
+    $('setRpm').onclick=()=>send('set_rpm',Number($('rpm').value)); $('setBattery').onclick=()=>send('set_battery',Number($('battery').value));
+    $('startAutoRpm').onclick=()=>send('set_rpm_follow_throttle',true,{max_rpm:Number($('autoRpmMax').value)}); $('stopAutoRpm').onclick=()=>send('set_rpm_follow_throttle',false,{max_rpm:Number($('autoRpmMax').value)});
+    document.querySelectorAll('[data-flag]').forEach(b=>b.onclick=()=>send('set_flag',b.dataset.flag));
+    document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>send(b.dataset.action));
+    document.querySelectorAll('[data-rpm]').forEach(b=>b.onclick=()=>send('set_rpm',Number(b.dataset.rpm)));
+    document.querySelectorAll('[data-battery]').forEach(b=>b.onclick=()=>send('set_battery',Number(b.dataset.battery)));
+    document.querySelectorAll('[data-adjust]').forEach(b=>b.onclick=()=>send('set_adjustment',b.dataset.adjust));
+    document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>send('set_mode',b.dataset.mode));
+    document.querySelectorAll('[data-tqv]').forEach(b=>b.onclick=()=>send('set_tqv',Number(b.dataset.tqv)));
+    document.querySelectorAll('[data-sensor]').forEach(b=>b.onclick=()=>send('set_sensor',false,{sensor:b.dataset.sensor}));
+    $('setTqv').onclick=()=>send('set_tqv',Number($('tqv').value));
+    $('allSensors').onclick=async()=>{for(const sensor of ['stm_online','can_ok','sas_ok','imu_ok','bms_ok','motor_left_ok','motor_right_ok'])await send('set_sensor',true,{sensor});};
+    $('sendCustom').onclick=()=>send('set_adjustment',$('custom').value); $('refresh').onclick=refresh;
+    setInterval(refresh,500); refresh();
+  </script>
+</body>
+</html>

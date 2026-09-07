@@ -1,523 +1,683 @@
-#include "DashboardUI.h"
-#include <cstdio>
-#include <cstring>
-#include <cmath>
-#include <cfloat>
-#include <string>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <winsock2.h>
 #include <windows.h>
+#include <ws2tcpip.h>
 #include <commdlg.h>
 
-static std::string WideFieldToUtf8(const wchar_t* value, size_t capacity) {
+#include "DashboardUI.h"
+
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <string>
+
+namespace {
+
+constexpr ImGuiTableFlags kTableFlags =
+    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame;
+
+const char* OnlineText(bool online) { return online ? "정상" : "대기"; }
+
+std::string WideFieldToUtf8(const wchar_t* value, size_t capacity) {
     size_t length = 0;
     while (length < capacity && value[length] != L'\0') ++length;
-    if (length == 0) return "--:--.---";
-    int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value,
-                                    static_cast<int>(length), nullptr, 0, nullptr, nullptr);
-    if (bytes <= 0) return "INVALID TIME";
+    if (length == 0) return "--";
+    const int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value,
+                                          static_cast<int>(length), nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return "경로 변환 오류";
     std::string result(static_cast<size_t>(bytes), '\0');
     WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value,
-                        static_cast<int>(length), &result[0], bytes, nullptr, nullptr);
+                        static_cast<int>(length), result.data(), bytes, nullptr, nullptr);
     return result;
 }
 
-DashboardUI::DashboardUI() {
-    ApplyF1Theme();
+void BeginMetric(const char* label) {
+    ImGui::TextDisabled("%s", label);
+    ImGui::SetWindowFontScale(1.35f);
 }
 
-void DashboardUI::ApplyF1Theme() {
+void EndMetric() { ImGui::SetWindowFontScale(1.0f); }
+
+}  // namespace
+
+DashboardUI::DashboardUI() { ApplyTheme(); }
+
+DashboardUI::~DashboardUI() {
+    if (liveCommandArmed_) SendEVLiveControlRequest(true);
+}
+
+void DashboardUI::ApplyTheme() {
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 8.0f;
-    style.FrameRounding = 6.0f;
-    style.PopupRounding = 6.0f;
-    style.ScrollbarRounding = 6.0f;
-    style.GrabRounding = 6.0f;
-    style.TabRounding = 6.0f;
+    style.WindowRounding = 7.0f;
+    style.ChildRounding = 6.0f;
+    style.FrameRounding = 5.0f;
+    style.ScrollbarRounding = 5.0f;
+    style.GrabRounding = 4.0f;
     style.WindowPadding = ImVec2(14.0f, 12.0f);
     style.FramePadding = ImVec2(9.0f, 6.0f);
-    style.ItemSpacing = ImVec2(10.0f, 8.0f);
-    
+    style.ItemSpacing = ImVec2(9.0f, 7.0f);
+
     ImVec4* colors = style.Colors;
-    colors[ImGuiCol_Text]                   = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
-    colors[ImGuiCol_TextDisabled]           = ImVec4(0.50f, 0.50f, 0.50f, 1.00f);
-    colors[ImGuiCol_WindowBg]               = ImVec4(0.06f, 0.06f, 0.06f, 0.94f);
-    colors[ImGuiCol_ChildBg]                = ImVec4(0.10f, 0.10f, 0.10f, 0.94f);
-    colors[ImGuiCol_PopupBg]                = ImVec4(0.08f, 0.08f, 0.08f, 0.94f);
-    colors[ImGuiCol_Border]                 = ImVec4(0.20f, 0.20f, 0.20f, 0.50f);
-    colors[ImGuiCol_BorderShadow]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    colors[ImGuiCol_FrameBg]                = ImVec4(0.16f, 0.16f, 0.16f, 0.54f);
-    colors[ImGuiCol_FrameBgHovered]         = ImVec4(0.26f, 0.26f, 0.26f, 0.40f);
-    colors[ImGuiCol_FrameBgActive]          = ImVec4(0.36f, 0.36f, 0.36f, 0.67f);
-    colors[ImGuiCol_TitleBg]                = ImVec4(0.04f, 0.04f, 0.04f, 1.00f);
-    colors[ImGuiCol_TitleBgActive]          = ImVec4(0.16f, 0.16f, 0.16f, 1.00f);
-    colors[ImGuiCol_TitleBgCollapsed]       = ImVec4(0.00f, 0.00f, 0.00f, 0.51f);
-    colors[ImGuiCol_MenuBarBg]              = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_ScrollbarBg]            = ImVec4(0.02f, 0.02f, 0.02f, 0.53f);
-    colors[ImGuiCol_ScrollbarGrab]          = ImVec4(0.31f, 0.31f, 0.31f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabHovered]   = ImVec4(0.41f, 0.41f, 0.41f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabActive]    = ImVec4(0.51f, 0.51f, 0.51f, 1.00f);
-    colors[ImGuiCol_CheckMark]              = COLOR_FERRARI_RED;
-    colors[ImGuiCol_SliderGrab]             = COLOR_FERRARI_RED;
-    colors[ImGuiCol_SliderGrabActive]       = ImVec4(0.98f, 0.26f, 0.26f, 1.00f);
-    colors[ImGuiCol_Button]                 = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-    colors[ImGuiCol_ButtonHovered]          = COLOR_FERRARI_RED;
-    colors[ImGuiCol_ButtonActive]           = ImVec4(0.98f, 0.26f, 0.26f, 1.00f);
-    colors[ImGuiCol_Header]                 = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-    colors[ImGuiCol_HeaderHovered]          = COLOR_FERRARI_RED;
-    colors[ImGuiCol_HeaderActive]           = ImVec4(0.98f, 0.26f, 0.26f, 1.00f);
-    colors[ImGuiCol_Separator]              = ImVec4(0.30f, 0.30f, 0.30f, 0.50f);
-    colors[ImGuiCol_SeparatorHovered]       = ImVec4(0.10f, 0.40f, 0.75f, 0.78f);
-    colors[ImGuiCol_SeparatorActive]        = ImVec4(0.10f, 0.40f, 0.75f, 1.00f);
+    colors[ImGuiCol_Text] = ImVec4(0.93f, 0.95f, 0.97f, 1.0f);
+    colors[ImGuiCol_TextDisabled] = COLOR_MUTED;
+    colors[ImGuiCol_WindowBg] = ImVec4(0.035f, 0.047f, 0.065f, 0.98f);
+    colors[ImGuiCol_ChildBg] = ImVec4(0.055f, 0.070f, 0.095f, 1.0f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.045f, 0.055f, 0.075f, 1.0f);
+    colors[ImGuiCol_Border] = ImVec4(0.16f, 0.22f, 0.29f, 0.9f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.09f, 0.12f, 0.16f, 1.0f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.12f, 0.18f, 0.24f, 1.0f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.15f, 0.23f, 0.31f, 1.0f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.025f, 0.035f, 0.050f, 1.0f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.07f, 0.11f, 0.15f, 1.0f);
+    colors[ImGuiCol_CheckMark] = COLOR_INFO_CYAN;
+    colors[ImGuiCol_SliderGrab] = COLOR_INFO_CYAN;
+    colors[ImGuiCol_Button] = ImVec4(0.10f, 0.15f, 0.20f, 1.0f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.15f, 0.28f, 0.36f, 1.0f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.18f, 0.36f, 0.46f, 1.0f);
+    colors[ImGuiCol_Header] = ImVec4(0.10f, 0.16f, 0.21f, 1.0f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.14f, 0.25f, 0.32f, 1.0f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.18f, 0.34f, 0.43f, 1.0f);
 }
 
-ImVec4 DashboardUI::GetTempColor(float temp) {
-    if (temp < 70.0f) return COLOR_F1_CYAN;
-    if (temp < 95.0f) return COLOR_F1_GREEN;
-    if (temp < 110.0f) return COLOR_F1_YELLOW;
-    return COLOR_FERRARI_RED;
-}
-
-void DashboardUI::UpdateSectorTiming(int sectorIndex, int lastSectorTime) {
-    if (lastSectorTime <= 0 || sectorIndex < 0 || sectorIndex > 2) return;
-    float timeS = (float)lastSectorTime / 1000.0f;
-    
-    // lastSectorTime은 방금 통과한 "이전" 섹터의 기록입니다.
-    // 현재 섹터가 1(S2)이라면, 방금 통과한 섹터는 0(S1)입니다.
-    int prevSector = (sectorIndex == 0) ? 2 : (sectorIndex - 1);
-
-    if (timeS == sectorTiming.lastTime[prevSector]) return;
-    
-    sectorTiming.lastTime[prevSector] = timeS;
-    if (timeS < sectorTiming.sessionBest[prevSector]) { 
-        sectorTiming.sessionBest[prevSector] = timeS; 
-        sectorTiming.personalBest[prevSector] = timeS; 
-        sectorTiming.colors[prevSector] = COLOR_F1_PURPLE; 
-    }
-    else if (timeS < sectorTiming.personalBest[prevSector]) { 
-        sectorTiming.personalBest[prevSector] = timeS; 
-        sectorTiming.colors[prevSector] = COLOR_F1_GREEN; 
-    }
-    else {
-        sectorTiming.colors[prevSector] = COLOR_F1_YELLOW;
-    }
-}
-
-void DashboardUI::Render(IDataSource* dataSource, bool& outDemoMode) {
+void DashboardUI::Render(IDataSource* dataSource) {
     if (!dataSource) return;
+    const EVTelemetry* telemetry = dataSource->GetEVTelemetry();
+    if (!telemetry) return;
 
-    SPageFilePhysics* pPhys = dataSource->GetPhysics();
-    SPageFileGraphics* pGraph = dataSource->GetGraphics();
-
-    if (pGraph) {
-        UpdateSectorTiming(pGraph->currentSectorIndex, pGraph->lastSectorTime);
-    }
-
-    RenderCommander(dataSource, outDemoMode);
-    if (showActualEnergyWin) RenderActualEnergyMeter();
-    if (showRecordedLogWin) RenderRecordedLog();
-
-    if (dataSource->IsConnected() && pPhys && pGraph) {
-        if (showDriverInputWin) RenderDriverInputs(pPhys, true);
-        if (showVirtualEnergyWin) RenderEnergyMeter(pPhys, dataSource->GetSourceName());
-        if (showTyreWin) RenderTyreMonitor(pPhys);
-        if (showTimingWin) RenderTiming(pGraph);
-        if (showMapWin) RenderTrackMap(pPhys);
-    }
+    const bool connected = dataSource->IsConnected();
+    UpdateGnssTrail(*telemetry);
+    RenderSystemStatus(dataSource, *telemetry);
+    if (showVehicleWindow_) RenderVehicle(*telemetry, connected);
+    if (showBatteryWindow_) RenderBattery(*telemetry, connected);
+    if (showGnssWindow_) RenderGnss(*telemetry, connected);
+    if (showControlWindow_) RenderControl(*telemetry, connected);
+    if (showRecordedLogWindow_) RenderRecordedLog();
 }
 
-void DashboardUI::RenderEnergyMeter(SPageFilePhysics* p, const char* sourceName) {
-    static double netEnergyKWh = 0.0;
-    static float previousPowerKW = 0.0f;
+void DashboardUI::RenderSystemStatus(IDataSource* source, const EVTelemetry& t) {
+    const bool connected = source->IsConnected();
+    ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(360, 270), ImGuiCond_Once);
+    ImGui::Begin("시스템 상태", nullptr, ImGuiWindowFlags_NoCollapse);
 
-    // Assetto Corsa does not expose real HV pack voltage/current. These values
-    // deliberately use the same estimator as EV_ErgMt and are always labelled virtual.
-    float throttle = p->gas < 0.0f ? 0.0f : (p->gas > 1.0f ? 1.0f : p->gas);
-    float brake = p->brake < 0.0f ? 0.0f : (p->brake > 1.0f ? 1.0f : p->brake);
-    float speedFactor = p->speedKmh / 90.0f;
-    if (speedFactor < 0.0f) speedFactor = 0.0f;
-    if (speedFactor > 1.0f) speedFactor = 1.0f;
-    float powerKW = 350.0f * throttle - 350.0f * brake * speedFactor + 2.2f + 0.006f * p->speedKmh;
-    float voltage = 600.0f - (powerKW > 0.0f ? powerKW * 0.095f : powerKW * 0.035f);
-    if (voltage < 545.0f) voltage = 545.0f;
-    if (voltage > 615.0f) voltage = 615.0f;
-    float current = powerKW * 1000.0f / voltage;
-    if (current < -749.0f) current = -749.0f;
-    if (current > 749.0f) current = 749.0f;
-    float lv = 13.72f - 0.12f * throttle;
-    float temp = 31.0f + 2.4f * throttle + 0.8f * brake;
-    float dt = ImGui::GetIO().DeltaTime;
-    if (dt > 0.0f && dt < 0.2f) netEnergyKWh += (previousPowerKW + powerKW) * 0.5 * dt / 3600.0;
-    previousPowerKW = powerKW;
+    ImGui::SetWindowFontScale(1.20f);
+    ImGui::TextColored(connected ? COLOR_OK_GREEN : COLOR_ALERT_RED,
+                       connected ? "실차 텔레메트리 수신 중" : "실차 텔레메트리 수신 대기");
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::TextDisabled("입력: %s", source->GetSourceName());
+    ImGui::TextDisabled("SEQ %u  |  지연 %.2f초  |  %.1f Hz", t.sequence, t.ageSeconds, t.receiveRateHz);
+    ImGui::SeparatorText("통신 상태");
 
-    ImGui::SetNextWindowPos(ImVec2(840, 20), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(410, 330), ImGuiCond_Once);
-    ImGui::Begin("VIRTUAL SIGNALS · ASSETTO CORSA", &showVirtualEnergyWin, ImGuiWindowFlags_NoCollapse);
-    ImGui::TextColored(COLOR_F1_YELLOW, "VIRTUAL DATA ONLY · NOT A CIRCUIT MEASUREMENT");
-    ImGui::TextDisabled("%s", sourceName);
-    ImGui::Separator();
-    if (ImGui::BeginTable("EnergyValues", 2, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
-        ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::Text("HV BUS VOLTAGE [VIRTUAL]"); ImGui::TableNextColumn(); ImGui::TextColored(COLOR_F1_CYAN, "%.1f V", voltage);
-        ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::Text("HV BUS CURRENT [VIRTUAL]"); ImGui::TableNextColumn(); ImGui::TextColored(COLOR_F1_GREEN, "%.1f A", current);
-        ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::Text("DC POWER [VIRTUAL]"); ImGui::TableNextColumn(); ImGui::TextColored(powerKW >= 0 ? COLOR_F1_YELLOW : COLOR_F1_CYAN, "%.1f kW", powerKW);
-        ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::Text("NET ENERGY [VIRTUAL]"); ImGui::TableNextColumn(); ImGui::Text("%.4f kWh", netEnergyKWh);
-        ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::Text("LV SUPPLY [VIRTUAL]"); ImGui::TableNextColumn(); ImGui::Text("%.2f V", lv);
-        ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::Text("MCU TEMP [VIRTUAL]"); ImGui::TableNextColumn(); ImGui::Text("%.2f C", temp);
+    if (ImGui::BeginTable("SystemLinks", 2, kTableFlags)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("Rear STM");
+        ImGui::TextColored(t.stmOnline ? COLOR_OK_GREEN : COLOR_ALERT_RED, "%s", OnlineText(t.stmOnline));
+        ImGui::TableNextColumn(); ImGui::TextDisabled("Front 센서/CAN");
+        ImGui::TextColored(t.frontSensorOnline && t.canOk ? COLOR_OK_GREEN : COLOR_WARN_AMBER,
+                           "%s / %s", OnlineText(t.frontSensorOnline), t.canOk ? "CAN 정상" : "CAN 대기");
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("BMS");
+        ImGui::TextColored(t.bmsOnline && !t.bmsFault ? COLOR_OK_GREEN : COLOR_WARN_AMBER,
+                           "%s", t.bmsOnline ? (t.bmsFault ? "경고 발생" : "정상") : "수신 대기");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("GNSS");
+        ImGui::TextColored(t.gnssOnline ? COLOR_OK_GREEN : COLOR_WARN_AMBER,
+                           "%s", t.gnssOnline ? "위치 수신" : "수신 대기");
         ImGui::EndTable();
     }
-    ImGui::Separator();
-    ImGui::TextDisabled("HV+/HV- -> isolated AFE -> ADC HV");
-    ImGui::TextDisabled("M6 busbar -> Hall sensor -> ADC CURRENT");
-    ImGui::TextDisabled("STM32F401 -> 16x average -> 100 Hz -> SD log");
+
+    ImGui::SeparatorText("표시 창");
+    if (ImGui::BeginTable("WindowToggles", 2)) {
+        ImGui::TableNextColumn(); ImGui::Checkbox("차량 센서", &showVehicleWindow_);
+        ImGui::TableNextColumn(); ImGui::Checkbox("배터리/BMS", &showBatteryWindow_);
+        ImGui::TableNextColumn(); ImGui::Checkbox("GNSS 트랙맵", &showGnssWindow_);
+        ImGui::TableNextColumn(); ImGui::Checkbox("TQV/회생 설정", &showControlWindow_);
+        ImGui::TableNextColumn(); ImGui::Checkbox("실측 에너지 로그", &showRecordedLogWindow_);
+        ImGui::EndTable();
+    }
+    ImGui::TextDisabled("가상값과 데모값은 표시하지 않습니다.");
     ImGui::End();
 }
 
-void DashboardUI::RenderActualEnergyMeter() {
-    ImGui::SetNextWindowPos(ImVec2(840, 365), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(410, 285), ImGuiCond_Once);
-    ImGui::Begin("REAL HARDWARE SIGNALS · ENERGY METER", &showActualEnergyWin, ImGuiWindowFlags_NoCollapse);
-    ImGui::TextColored(COLOR_FERRARI_RED, "OFFLINE · NO HARDWARE DATA");
-    ImGui::TextDisabled("Waiting for isolated CAN/UART receiver");
-    ImGui::Separator();
-    if (ImGui::BeginTable("RealEnergyValues", 2, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
-        const char* labels[] = {"HV BUS VOLTAGE", "HV BUS CURRENT", "DC POWER", "NET ENERGY", "LV SUPPLY", "MCU TEMPERATURE"};
-        const char* routes[] = {"HV+/HV- ADC", "HALL CURRENT ADC", "CALCULATED", "INTEGRATED", "LV ADC", "INTERNAL ADC"};
-        for (int i = 0; i < 6; ++i) {
-            ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(labels[i]);
-            ImGui::TableNextColumn(); ImGui::TextDisabled("--  [%s]", routes[i]);
-        }
-        ImGui::EndTable();
-    }
-    ImGui::Separator();
-    ImGui::TextWrapped("This window accepts measured values only. Simulator estimates are never copied into this panel.");
-    ImGui::End();
-}
+void DashboardUI::RenderVehicle(const EVTelemetry& t, bool connected) {
+    ImGui::SetNextWindowPos(ImVec2(392, 16), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(990, 410), ImGuiCond_Once);
+    ImGui::Begin("차량 실시간 센서", &showVehicleWindow_, ImGuiWindowFlags_NoCollapse);
 
-void DashboardUI::RenderCommander(IDataSource* dataSource, bool& outDemoMode) {
-    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
-    ImGui::Begin("F1 PIT WALL CONTROL", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
-    
-    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "SYS_STATUS:");
+    ImGui::TextColored(connected ? COLOR_OK_GREEN : COLOR_ALERT_RED,
+                       connected ? "실제 차량 데이터" : "UDP 9004 수신 대기");
     ImGui::SameLine();
-    if (dataSource->IsConnected()) {
-        ImGui::TextColored(COLOR_F1_GREEN, "ONLINE (%s)", dataSource->GetSourceName());
-    } else {
-        ImGui::TextColored(COLOR_FERRARI_RED, "OFFLINE (WAITING AC)");
-    }
-    
-    ImGui::Separator();
-    
-    ImGui::Checkbox("DEMO_MODE [VIRTUAL]", &outDemoMode);
-    ImGui::SameLine(150);
-    ImGui::Checkbox("WEB_BROADCAST (UDP) [VIRTUAL SOURCE]", &enableWebBroadcast);
-    
-    ImGui::Separator();
-    ImGui::Text("PANEL TOGGLES (ONE CHECKBOX PER WINDOW)");
-    if (ImGui::BeginTable("PanelToggleTable", 2)) {
-        ImGui::TableNextColumn(); ImGui::Checkbox("DRIVER INPUTS [VIRTUAL]", &showDriverInputWin);
-        ImGui::TableNextColumn(); ImGui::Checkbox("EV ENERGY [VIRTUAL]", &showVirtualEnergyWin);
-        ImGui::TableNextColumn(); ImGui::Checkbox("TYRE & BRAKE [VIRTUAL]", &showTyreWin);
-        ImGui::TableNextColumn(); ImGui::Checkbox("TIMING [VIRTUAL]", &showTimingWin);
-        ImGui::TableNextColumn(); ImGui::Checkbox("TRACK MAP [VIRTUAL]", &showMapWin);
-        ImGui::TableNextColumn(); ImGui::Checkbox("REAL HARDWARE ENERGY", &showActualEnergyWin);
-        ImGui::TableNextColumn(); ImGui::Checkbox("RECORDED ENERGY LOG", &showRecordedLogWin);
+    ImGui::TextDisabled("패킷 %llu / 누락 %llu  |  전송경로 %s",
+                        static_cast<unsigned long long>(t.receivedPackets),
+                        static_cast<unsigned long long>(t.lostPackets),
+                        t.telemetryTransport[0] ? t.telemetryTransport : "--");
+
+    if (ImGui::BeginTable("VehiclePrimary", 3, kTableFlags)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); BeginMetric("차량 속도");
+        if (connected) ImGui::TextColored(COLOR_INFO_CYAN, "%.1f km/h", t.speedKmh); else ImGui::Text("--"); EndMetric();
+        ImGui::TableNextColumn(); BeginMetric("좌측 모터");
+        if (connected) ImGui::Text("%u RPM", t.rpmLeft); else ImGui::Text("--"); EndMetric();
+        ImGui::TableNextColumn(); BeginMetric("우측 모터");
+        if (connected) ImGui::Text("%u RPM", t.rpmRight); else ImGui::Text("--"); EndMetric();
         ImGui::EndTable();
     }
-    ImGui::Separator();
-    if (virtualRecorder) {
-        if (virtualRecorder->IsRecording()) {
-            ImGui::TextColored(COLOR_F1_GREEN, "VIRTUAL RECORDER: RECORDING · %llu packets",
-                               static_cast<unsigned long long>(virtualRecorder->RecordCount()));
-        } else {
-            ImGui::TextDisabled("VIRTUAL RECORDER: WAITING FOR AC_LIVE");
-        }
-        const std::string recorderError = virtualRecorder->LastError();
-        if (!recorderError.empty()) ImGui::TextColored(COLOR_FERRARI_RED, "RECORDER ERROR: %s", recorderError.c_str());
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("가속 페달 (TPS)  |  RAW %s", connected ? std::to_string(t.tpsRaw).c_str() : "--");
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, t.tpsOk ? COLOR_OK_GREEN : COLOR_ALERT_RED);
+    char throttleText[32] = "--";
+    if (connected && t.tpsOk) snprintf(throttleText, sizeof(throttleText), "%.1f %%", t.tpsPercent);
+    ImGui::ProgressBar(connected && t.tpsOk ? std::clamp(t.tpsPercent / 100.0f, 0.0f, 1.0f) : 0.0f,
+                       ImVec2(-1.0f, 24.0f), throttleText);
+    ImGui::PopStyleColor();
+
+    ImGui::SeparatorText("조향 및 차체 센서");
+    if (ImGui::BeginTable("VehicleSensors", 4, kTableFlags)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("조향각");
+        if (connected && t.sasOk) ImGui::TextColored(COLOR_INFO_CYAN, "%+.2f deg", t.steeringDeg); else ImGui::Text("--");
+        ImGui::TextDisabled("SAS 상대 %+.2f deg", t.sasRelativeDeg);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("SAS 원시값");
+        if (connected) ImGui::Text("%u / 16383", t.sasRaw); else ImGui::Text("--");
+        ImGui::TextDisabled("중앙값 %u", t.sasCenterRaw);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("Yaw rate");
+        if (connected) ImGui::Text("%.3f rad/s", t.yawRateRadS); else ImGui::Text("--");
+        ImGui::TextDisabled("Rear IMU");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("횡가속도");
+        if (connected) ImGui::Text("%.2f m/s²", t.lateralAccelMS2); else ImGui::Text("--");
+        ImGui::TextDisabled("펄스 L/R %u / %u", t.captureLeft, t.captureRight);
+        ImGui::EndTable();
     }
-    
+
+    ImGui::SeparatorText("TQV 및 회생 상태");
+    if (ImGui::BeginTable("VehicleOutput", 4, kTableFlags)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("좌측 출력");
+        if (connected) ImGui::Text("DAC %u  |  %.2f kW", t.dacLeft, t.powerLeftKw); else ImGui::Text("--");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("우측 출력");
+        if (connected) ImGui::Text("DAC %u  |  %.2f kW", t.dacRight, t.powerRightKw); else ImGui::Text("--");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("TQV 요청 / 적용");
+        if (connected) ImGui::Text("%.0f%% / %.0f%%", t.tvRequestedPercent, t.tvAppliedPercent); else ImGui::Text("--");
+        ImGui::TextColored(t.tvLimited ? COLOR_WARN_AMBER : COLOR_OK_GREEN, "%s", t.tvLimited ? "제한됨" : (t.tvActive ? "작동" : "대기"));
+        ImGui::TableNextColumn(); ImGui::TextDisabled("회생 요청 / 적용");
+        if (connected) ImGui::Text("%.0f%% / %.0f%%", t.regenRequestedPercent, t.regenAppliedPercent); else ImGui::Text("--");
+        ImGui::TextColored(t.regenReady ? COLOR_OK_GREEN : COLOR_WARN_AMBER, "%s", t.regenReady ? "준비" : "검증 대기");
+        ImGui::EndTable();
+    }
+
+    ImGui::TextDisabled("주행모드 %s  |  제한 사유 %s  |  Front 출처 %s",
+                        EVDriveModeName(t.driveMode), t.limitReason, t.frontSource);
+    ImGui::TextColored(t.faultCode == 0 ? COLOR_OK_GREEN : COLOR_ALERT_RED,
+                       "차량 오류: %u · %s", t.faultCode, EVFaultName(t.faultCode));
+    ImGui::End();
+}
+
+void DashboardUI::RenderBattery(const EVTelemetry& t, bool connected) {
+    ImGui::SetNextWindowPos(ImVec2(392, 442), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(990, 420), ImGuiCond_Once);
+    ImGui::Begin("배터리 / DALY BMS", &showBatteryWindow_, ImGuiWindowFlags_NoCollapse);
+
+    const bool live = connected && t.bmsOnline;
+    ImGui::TextColored(live && !t.bmsFault ? COLOR_OK_GREEN : (t.bmsFault ? COLOR_ALERT_RED : COLOR_WARN_AMBER),
+                       live ? (t.bmsFault ? "BMS 경고 발생" : "BMS 실제값 수신 중") : "BMS 데이터 수신 대기");
+    ImGui::SameLine();
+    ImGui::TextDisabled("출처 %s  |  지연 %.0f ms  |  %s", t.bmsSource, t.bmsAgeMs,
+                        t.bmsModel[0] ? t.bmsModel : "모델 미확인");
+
+    if (ImGui::BeginTable("BatteryPrimary", 4, kTableFlags)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); BeginMetric("충전 상태");
+        if (live) ImGui::TextColored(COLOR_INFO_CYAN, "%.1f %%", t.batterySocPercent); else ImGui::Text("--"); EndMetric();
+        ImGui::TableNextColumn(); BeginMetric("팩 전압");
+        if (live) ImGui::Text("%.1f V", t.batteryPackVoltageV); else ImGui::Text("--"); EndMetric();
+        ImGui::TableNextColumn(); BeginMetric("팩 전류");
+        if (live) ImGui::Text("%+.1f A", t.batteryCurrentA); else ImGui::Text("--"); EndMetric();
+        ImGui::TableNextColumn(); BeginMetric("팩 전력");
+        if (live) ImGui::TextColored(COLOR_WARN_AMBER, "%+.2f kW", t.batteryPowerKw); else ImGui::Text("--"); EndMetric();
+        ImGui::EndTable();
+    }
+
+    if (ImGui::BeginTable("BatteryHealth", 4, kTableFlags)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("최고 / 최저 셀");
+        if (live) ImGui::Text("%.3f V (#%u) / %.3f V (#%u)", t.bmsMaxCellVoltageV, t.bmsMaxCellNumber,
+                              t.bmsMinCellVoltageV, t.bmsMinCellNumber); else ImGui::Text("--");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("셀 편차");
+        if (live) ImGui::TextColored(t.bmsCellDeltaMv <= 20.0f ? COLOR_OK_GREEN :
+                                     (t.bmsCellDeltaMv <= 50.0f ? COLOR_WARN_AMBER : COLOR_ALERT_RED),
+                                     "%.0f mV", t.bmsCellDeltaMv); else ImGui::Text("--");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("온도 범위");
+        if (live) ImGui::Text("%.0f ~ %.0f °C", t.bmsTempMinC, t.bmsTempMaxC); else ImGui::Text("--");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("MOS / 밸런싱");
+        if (live) ImGui::Text("충전 %s · 방전 %s · %s", t.bmsChargeMosOn ? "ON" : "OFF",
+                              t.bmsDischargeMosOn ? "ON" : "OFF", t.bmsBalancing ? "밸런싱" : "대기");
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("셀별 전압 · 팩 내부 상대 비교");
+    const std::uint8_t count = live ? t.bmsCellVoltageCount : 0;
+    if (count == 0) {
+        ImGui::TextDisabled("셀 전압 프레임을 기다리고 있습니다. 값이 없을 때 임의값을 표시하지 않습니다.");
+        ImGui::End();
+        return;
+    }
+
+    float minimum = FLT_MAX;
+    float maximum = -FLT_MAX;
+    float sum = 0.0f;
+    std::uint8_t validCount = 0;
+    for (std::uint8_t i = 0; i < count; ++i) {
+        const float value = t.bmsCellVoltagesV[i];
+        if (!std::isfinite(value) || value <= 0.0f) continue;
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+        sum += value;
+        ++validCount;
+    }
+    if (validCount == 0) {
+        ImGui::TextColored(COLOR_ALERT_RED, "유효한 셀 전압이 없습니다.");
+        ImGui::End();
+        return;
+    }
+
+    const float average = sum / validCount;
+    const float visualMin = minimum - 0.010f;
+    const float visualSpan = std::max(0.020f, maximum - minimum + 0.020f);
+    const int columns = std::min<int>(7, count);
+    if (ImGui::BeginTable("BatteryCells", columns, kTableFlags)) {
+        for (std::uint8_t i = 0; i < count; ++i) {
+            const float value = t.bmsCellVoltagesV[i];
+            const float deviationMv = (value - average) * 1000.0f;
+            const float absoluteDeviation = std::fabs(deviationMv);
+            const ImVec4 color = absoluteDeviation <= 10.0f ? COLOR_OK_GREEN :
+                                 (absoluteDeviation <= 25.0f ? COLOR_WARN_AMBER : COLOR_ALERT_RED);
+            ImGui::TableNextColumn();
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::TextDisabled("셀 %02u", static_cast<unsigned>(i + 1));
+            ImGui::TextColored(color, "%.3f V", value);
+            char overlay[24];
+            snprintf(overlay, sizeof(overlay), "%+.0f mV", deviationMv);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, color);
+            ImGui::ProgressBar(std::clamp((value - visualMin) / visualSpan, 0.0f, 1.0f), ImVec2(-1.0f, 17.0f), overlay);
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TextDisabled("평균 %.3f V  |  그래프는 현재 팩의 최저~최고 셀 상대 범위이며 절대 SOC 눈금이 아닙니다.", average);
+    ImGui::TextColored(t.bmsFault ? COLOR_ALERT_RED : COLOR_OK_GREEN, "BMS 알람: %s", t.bmsAlarmSummary);
+    ImGui::End();
+}
+
+void DashboardUI::UpdateGnssTrail(const EVTelemetry& t) {
+    if (!t.gnssOnline || t.gnssAgeMs > 2000.0f) return;
+    if (!gnssOriginValid_) {
+        gnssOriginLatitude_ = t.gnssLatitudeDeg;
+        gnssOriginLongitude_ = t.gnssLongitudeDeg;
+        gnssOriginValid_ = true;
+    }
+    constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+    const double x = (t.gnssLongitudeDeg - gnssOriginLongitude_) * 111320.0 *
+                     std::cos(gnssOriginLatitude_ * kDegToRad);
+    const double y = (t.gnssLatitudeDeg - gnssOriginLatitude_) * 110540.0;
+    const ImVec2 point(static_cast<float>(x), static_cast<float>(y));
+    if (gnssTrailMeters_.empty() || std::hypot(point.x - gnssTrailMeters_.back().x,
+                                               point.y - gnssTrailMeters_.back().y) >= 1.0f) {
+        gnssTrailMeters_.push_back(point);
+        if (gnssTrailMeters_.size() > 5000) gnssTrailMeters_.pop_front();
+    }
+}
+
+void DashboardUI::RenderGnss(const EVTelemetry& t, bool connected) {
+    ImGui::SetNextWindowPos(ImVec2(16, 302), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(360, 560), ImGuiCond_Once);
+    ImGui::Begin("GNSS 트랙맵", &showGnssWindow_, ImGuiWindowFlags_NoCollapse);
+
+    const bool live = connected && t.gnssOnline && t.gnssAgeMs < 2000.0f;
+    ImGui::TextColored(live ? COLOR_OK_GREEN : COLOR_WARN_AMBER,
+                       live ? "GNSS 실제 위치 수신 중" : "GNSS 수신기 연결 대기");
+    if (ImGui::Button("주행 궤적 초기화")) {
+        gnssTrailMeters_.clear();
+        gnssOriginValid_ = false;
+    }
+
+    if (ImGui::BeginTable("GnssInfo", 2, kTableFlags)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("Fix / 위성");
+        if (live) ImGui::Text("%u / %u개", t.gnssFixType, t.gnssSatellites); else ImGui::Text("--");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("HDOP / 지연");
+        if (live) ImGui::Text("%.2f / %.0f ms", t.gnssHdop, t.gnssAgeMs); else ImGui::Text("--");
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("위도");
+        if (live) ImGui::Text("%.7f°", t.gnssLatitudeDeg); else ImGui::Text("--");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("경도");
+        if (live) ImGui::Text("%.7f°", t.gnssLongitudeDeg); else ImGui::Text("--");
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("고도");
+        if (live) ImGui::Text("%.1f m", t.gnssAltitudeM); else ImGui::Text("--");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("진행 방향");
+        if (live) ImGui::Text("%.1f°", t.gnssHeadingDeg); else ImGui::Text("--");
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("주행 궤적");
+    const ImVec2 canvasPosition = ImGui::GetCursorScreenPos();
+    ImVec2 canvasSize = ImGui::GetContentRegionAvail();
+    canvasSize.y = std::max(250.0f, canvasSize.y);
+    ImGui::InvisibleButton("GnssCanvas", canvasSize);
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 canvasEnd(canvasPosition.x + canvasSize.x, canvasPosition.y + canvasSize.y);
+    draw->AddRectFilled(canvasPosition, canvasEnd, IM_COL32(10, 18, 25, 255));
+    draw->AddRect(canvasPosition, canvasEnd, IM_COL32(55, 80, 100, 255));
+    for (int i = 1; i < 5; ++i) {
+        const float x = canvasPosition.x + canvasSize.x * i / 5.0f;
+        const float y = canvasPosition.y + canvasSize.y * i / 5.0f;
+        draw->AddLine(ImVec2(x, canvasPosition.y), ImVec2(x, canvasEnd.y), IM_COL32(28, 45, 58, 255));
+        draw->AddLine(ImVec2(canvasPosition.x, y), ImVec2(canvasEnd.x, y), IM_COL32(28, 45, 58, 255));
+    }
+
+    if (!live || gnssTrailMeters_.empty()) {
+        const char* waiting = "GNSS 좌표 수신 시 실제 주행 궤적을 표시합니다";
+        const ImVec2 textSize = ImGui::CalcTextSize(waiting);
+        draw->AddText(ImVec2(canvasPosition.x + (canvasSize.x - textSize.x) * 0.5f,
+                             canvasPosition.y + canvasSize.y * 0.5f),
+                      ImGui::ColorConvertFloat4ToU32(COLOR_MUTED), waiting);
+        ImGui::End();
+        return;
+    }
+
+    float minX = gnssTrailMeters_.front().x, maxX = minX;
+    float minY = gnssTrailMeters_.front().y, maxY = minY;
+    for (const ImVec2& point : gnssTrailMeters_) {
+        minX = std::min(minX, point.x); maxX = std::max(maxX, point.x);
+        minY = std::min(minY, point.y); maxY = std::max(maxY, point.y);
+    }
+    const float spanX = std::max(20.0f, maxX - minX);
+    const float spanY = std::max(20.0f, maxY - minY);
+    const float scale = std::min((canvasSize.x - 32.0f) / spanX, (canvasSize.y - 32.0f) / spanY);
+    const float centerX = (minX + maxX) * 0.5f;
+    const float centerY = (minY + maxY) * 0.5f;
+    auto toScreen = [&](const ImVec2& point) {
+        return ImVec2(canvasPosition.x + canvasSize.x * 0.5f + (point.x - centerX) * scale,
+                      canvasPosition.y + canvasSize.y * 0.5f - (point.y - centerY) * scale);
+    };
+    for (size_t i = 1; i < gnssTrailMeters_.size(); ++i) {
+        draw->AddLine(toScreen(gnssTrailMeters_[i - 1]), toScreen(gnssTrailMeters_[i]),
+                      IM_COL32(38, 199, 224, 220), 2.5f);
+    }
+    const ImVec2 vehicle = toScreen(gnssTrailMeters_.back());
+    draw->AddCircleFilled(vehicle, 6.0f, IM_COL32(51, 214, 120, 255));
+    const float headingRad = (t.gnssHeadingDeg - 90.0f) * 3.14159265f / 180.0f;
+    draw->AddLine(vehicle, ImVec2(vehicle.x + std::cos(headingRad) * 18.0f,
+                                  vehicle.y + std::sin(headingRad) * 18.0f),
+                  IM_COL32(255, 190, 45, 255), 3.0f);
+    ImGui::End();
+}
+
+bool DashboardUI::SendEVRelayPing() {
+    SOCKET commandSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (commandSocket == INVALID_SOCKET) {
+        strcpy_s(localControlStatus_, "UDP 소켓 생성 실패");
+        return false;
+    }
+    sockaddr_in target = {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(9005);
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    ++controlRequestId_;
+    char payload[128] = {};
+    const int length = snprintf(payload, sizeof(payload),
+                                "{\"type\":\"relay_ping\",\"request_id\":%u}", controlRequestId_);
+    const int sent = sendto(commandSocket, payload, length, 0,
+                            reinterpret_cast<const sockaddr*>(&target), sizeof(target));
+    closesocket(commandSocket);
+    if (sent != length) {
+        strcpy_s(localControlStatus_, "링크 시험 전송 실패");
+        return false;
+    }
+    snprintf(localControlStatus_, sizeof(localControlStatus_), "링크 시험 %u 전송, ESP 확인 대기", controlRequestId_);
+    return true;
+}
+
+bool DashboardUI::SendEVControlRequest() {
+    SOCKET commandSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (commandSocket == INVALID_SOCKET) {
+        strcpy_s(localControlStatus_, "UDP 소켓 생성 실패");
+        return false;
+    }
+    sockaddr_in target = {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(9005);
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    ++controlRequestId_;
+    char payload[512] = {};
+    const int length = snprintf(
+        payload, sizeof(payload),
+        "{\"type\":\"pit_config\",\"request_id\":%u,\"tv_limit_pct\":%.0f,"
+        "\"regen_limit_pct\":%.0f,\"tv_ramp_pct_s\":%d,\"regen_ramp_pct_s\":%d,"
+        "\"tv_enable\":%s,\"regen_enable\":%s}",
+        controlRequestId_, stagedTvLimit_, stagedRegenLimit_, stagedTvRamp_, stagedRegenRamp_,
+        stagedTvEnable_ ? "true" : "false", stagedRegenEnable_ ? "true" : "false");
+    const int sent = sendto(commandSocket, payload, length, 0,
+                            reinterpret_cast<const sockaddr*>(&target), sizeof(target));
+    closesocket(commandSocket);
+    if (sent != length) {
+        strcpy_s(localControlStatus_, "피트 설정 전송 실패");
+        return false;
+    }
+    snprintf(localControlStatus_, sizeof(localControlStatus_), "설정 %u 전송, Gateway/STM 응답 대기", controlRequestId_);
+    return true;
+}
+
+bool DashboardUI::SendEVLiveControlRequest(bool neutral, bool heartbeat) {
+    SOCKET commandSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (commandSocket == INVALID_SOCKET) {
+        strcpy_s(localControlStatus_, "UDP 소켓 생성 실패");
+        return false;
+    }
+    sockaddr_in target = {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(9005);
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    if (!heartbeat) ++controlRequestId_;
+    const float strength = neutral ? 0.0f : (heartbeat ? activeLiveTvStrength_ : std::round(stagedTvStrength_ / 5.0f) * 5.0f);
+    const float limit = heartbeat ? activeLiveTvLimit_ : std::round(stagedTvLimit_ / 5.0f) * 5.0f;
+    const bool enabled = neutral ? false : (heartbeat ? liveCommandArmed_ : stagedLiveTvEnable_);
+    char payload[256] = {};
+    const int length = snprintf(payload, sizeof(payload),
+                                "{\"type\":\"live_tv\",\"request_id\":%u,\"strength_pct\":%.0f,"
+                                "\"limit_pct\":%.0f,\"tv_enable\":%s}",
+                                controlRequestId_, strength, limit, enabled ? "true" : "false");
+    const int sent = sendto(commandSocket, payload, length, 0,
+                            reinterpret_cast<const sockaddr*>(&target), sizeof(target));
+    closesocket(commandSocket);
+    if (sent != length) {
+        strcpy_s(localControlStatus_, "실시간 TQV 전송 실패");
+        return false;
+    }
+    if (neutral || !enabled) liveCommandArmed_ = false;
+    else if (!heartbeat) {
+        activeLiveTvStrength_ = strength;
+        activeLiveTvLimit_ = limit;
+        liveCommandArmed_ = true;
+    }
+    lastLiveHeartbeatTime_ = static_cast<double>(GetTickCount64()) / 1000.0;
+    if (!heartbeat) snprintf(localControlStatus_, sizeof(localControlStatus_), "실시간 요청 %u 전송, Rear 응답 대기", controlRequestId_);
+    return true;
+}
+
+void DashboardUI::RenderControl(const EVTelemetry& t, bool connected) {
+    ImGui::SetNextWindowPos(ImVec2(300, 70), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(800, 760), ImGuiCond_Once);
+    ImGui::Begin("TQV / 회생제동 피트 설정", &showControlWindow_, ImGuiWindowFlags_NoCollapse);
+
+    if (!evControlInitialized_ && connected) {
+        stagedTvStrength_ = t.tvRequestedPercent;
+        stagedTvLimit_ = t.tvLimitPercent;
+        stagedRegenLimit_ = t.regenLimitPercent;
+        stagedTvRamp_ = static_cast<int>(t.tvRampPercentPerSecond);
+        stagedRegenRamp_ = static_cast<int>(t.regenRampPercentPerSecond);
+        evControlInitialized_ = true;
+    }
+
+    ImGui::TextColored(t.gatewayControlEnabled ? COLOR_WARN_AMBER : COLOR_OK_GREEN,
+                       "Gateway: %s", t.gatewayControlEnabled ? "제어 허용 모드" : "읽기 전용 모드");
+    ImGui::TextWrapped("모든 설정은 Rear STM 안전 조건을 우회하지 않습니다. 실차 출력 전에는 PIT ENABLE, 정차, TPS/RPM 및 오류 조건을 다시 확인합니다.");
+
+    ImGui::SeparatorText("통신 링크 시험");
+    const bool mayPing = connected && t.gatewayControlEnabled && t.relayLinkOnline;
+    if (!mayPing) ImGui::BeginDisabled();
+    if (ImGui::Button("ESP 링크 시험 (STM 출력 없음)", ImVec2(280, 34))) SendEVRelayPing();
+    if (!mayPing) ImGui::EndDisabled();
+    ImGui::SameLine(); ImGui::Text("요청 %u", t.commandRequestId);
+
+    if (ImGui::BeginTable("ControlState", 3, kTableFlags)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("휠 요청"); ImGui::Text("TQV %.0f%% · 회생 %.0f%%", t.tvRequestedPercent, t.regenRequestedPercent);
+        ImGui::Text("SEQ %u · %s", t.driverControlSequence, t.driverControlFresh ? "최신" : "오래됨");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("Rear 적용"); ImGui::Text("TQV %.0f%% · 회생 %.0f%%", t.tvAppliedPercent, t.regenAppliedPercent);
+        ImGui::Text("SEQ %u · %s", t.rearStatusSequence, t.limitReason);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("피트 제한"); ImGui::Text("TQV %.0f%% · 회생 %.0f%%", t.tvLimitPercent, t.regenLimitPercent);
+        ImGui::Text("Ramp %.0f%%/s", t.tvRampPercentPerSecond);
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("실시간 TQV 요청");
+    ImGui::SliderFloat("TQV 강도", &stagedTvStrength_, 0.0f, 100.0f, "%.0f %%");
+    stagedTvStrength_ = std::round(stagedTvStrength_ / 5.0f) * 5.0f;
+    ImGui::Checkbox("실시간 TQV 허용", &stagedLiveTvEnable_);
+    const bool mayLiveSend = connected && t.gatewayControlEnabled && t.stmOnline && t.faultCode == 0;
+    if (liveCommandArmed_) {
+        if (!mayLiveSend) liveCommandArmed_ = false;
+        else if (static_cast<double>(GetTickCount64()) / 1000.0 - lastLiveHeartbeatTime_ >= 0.25 &&
+                 !SendEVLiveControlRequest(false, true)) liveCommandArmed_ = false;
+    }
+    if (!mayLiveSend) ImGui::BeginDisabled();
+    if (ImGui::Button("실시간 TQV 전송", ImVec2(210, 34))) SendEVLiveControlRequest(false);
+    if (!mayLiveSend) ImGui::EndDisabled();
+    ImGui::SameLine();
+    const bool mayNeutral = connected && t.gatewayControlEnabled && t.stmOnline;
+    if (!mayNeutral) ImGui::BeginDisabled();
+    if (ImGui::Button("50:50 중립 요청", ImVec2(210, 34))) {
+        stagedTvStrength_ = 0.0f;
+        stagedLiveTvEnable_ = false;
+        SendEVLiveControlRequest(true);
+    }
+    if (!mayNeutral) ImGui::EndDisabled();
+    ImGui::TextColored(liveCommandArmed_ ? COLOR_OK_GREEN : COLOR_MUTED,
+                       "CMake heartbeat: %s", liveCommandArmed_ ? "작동" : "대기");
+
+    ImGui::SeparatorText("정차 피트 설정");
+    ImGui::SliderFloat("TQV 최대값", &stagedTvLimit_, 0.0f, 100.0f, "%.0f %%");
+    ImGui::SliderFloat("회생 최대값", &stagedRegenLimit_, 0.0f, 100.0f, "%.0f %%");
+    ImGui::SliderInt("TQV 변화율", &stagedTvRamp_, 10, 250, "%d %%/s");
+    ImGui::SliderInt("회생 변화율", &stagedRegenRamp_, 5, 100, "%d %%/s");
+    ImGui::Checkbox("TQV 허용", &stagedTvEnable_);
+    ImGui::SameLine(); ImGui::Checkbox("회생 허용", &stagedRegenEnable_);
+    const bool maySend = connected && t.gatewayControlEnabled && t.pitAdjustAllowed;
+    if (!maySend) ImGui::BeginDisabled();
+    if (ImGui::Button("STM에 임시 적용", ImVec2(220, 34))) SendEVControlRequest();
+    if (!maySend) ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("현재 제한값 복사", ImVec2(180, 34))) {
+        stagedTvLimit_ = t.tvLimitPercent;
+        stagedRegenLimit_ = t.regenLimitPercent;
+        stagedTvRamp_ = static_cast<int>(t.tvRampPercentPerSecond);
+        stagedRegenRamp_ = static_cast<int>(t.regenRampPercentPerSecond);
+    }
+    ImGui::Text("로컬: %s", localControlStatus_);
+    const bool commandFailed = strcmp(t.commandStatus, "REJECTED") == 0 ||
+                               strcmp(t.commandStatus, "FAILSAFE") == 0 ||
+                               strcmp(t.commandStatus, "TIMEOUT") == 0;
+    ImGui::TextColored(commandFailed ? COLOR_ALERT_RED :
+                       (strcmp(t.commandStatus, "ACKED") == 0 ? COLOR_OK_GREEN : COLOR_INFO_CYAN),
+                       "Gateway/STM: %s · %s", t.commandStatus, t.commandMessage);
+    ImGui::TextDisabled("회생 적용값은 BMS 제한, 브레이크 입력 타당성, 모터 컨트롤러 검증 전까지 0으로 유지합니다.");
     ImGui::End();
 }
 
 void DashboardUI::RenderRecordedLog() {
-    ImGui::SetNextWindowPos(ImVec2(270, 70), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(860, 740), ImGuiCond_Once);
-    ImGui::Begin("RECORDED ENERGY LOG", &showRecordedLogWin, ImGuiWindowFlags_NoCollapse);
+    ImGui::SetNextWindowPos(ImVec2(230, 70), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(920, 760), ImGuiCond_Once);
+    ImGui::Begin("실측 에너지 로그", &showRecordedLogWindow_, ImGuiWindowFlags_NoCollapse);
 
-    if (ImGui::Button("OPEN FSK-EEM LOG", ImVec2(190, 34))) {
+    if (ImGui::Button("FSK-EEM 로그 열기", ImVec2(190, 34))) {
         wchar_t path[4096] = {};
-        OPENFILENAMEW dialog{};
+        OPENFILENAMEW dialog = {};
         dialog.lStructSize = sizeof(dialog);
         dialog.lpstrFilter = L"FSK Energy Meter Log (*.log)\0*.log\0All Files (*.*)\0*.*\0";
         dialog.lpstrFile = path;
         dialog.nMaxFile = static_cast<DWORD>(sizeof(path) / sizeof(path[0]));
         dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
         if (GetOpenFileNameW(&dialog)) {
-            recordedLog.Load(path);
-            selectedLogSample = 0;
+            recordedLog_.Load(path);
+            selectedLogSample_ = 0;
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("CLEAR", ImVec2(90, 34))) { recordedLog.Clear(); selectedLogSample = 0; }
-    if (virtualRecorder) {
-        const std::wstring latestPath = virtualRecorder->CurrentFilePath();
-        if (!latestPath.empty()) {
-            ImGui::SameLine();
-            if (ImGui::Button("OPEN LATEST DUMMY", ImVec2(180, 34))) {
-                recordedLog.Load(latestPath.c_str());
-                selectedLogSample = 0;
-            }
-        }
+    if (ImGui::Button("닫기", ImVec2(80, 34))) {
+        recordedLog_.Clear();
+        selectedLogSample_ = 0;
     }
     ImGui::Separator();
 
-    if (!recordedLog.IsLoaded()) {
-        ImGui::Dummy(ImVec2(0, 25));
-        ImGui::SetWindowFontScale(1.35f);
-        ImGui::TextColored(COLOR_F1_CYAN, "NO RECORDED LOG LOADED");
-        ImGui::SetWindowFontScale(1.0f);
-        ImGui::Spacing();
-        ImGui::TextWrapped("Copy an FSK-EEM .log file from the SD drive and select OPEN FSK-EEM LOG.");
-        if (!recordedLog.error.empty()) ImGui::TextColored(COLOR_FERRARI_RED, "%s", recordedLog.error.c_str());
-        ImGui::End(); return;
+    if (!recordedLog_.IsLoaded()) {
+        ImGui::TextColored(COLOR_INFO_CYAN, "실측 로그 파일을 선택하세요.");
+        ImGui::TextDisabled("지원 형식: FSK-EEM .log");
+        if (!recordedLog_.error.empty()) ImGui::TextColored(COLOR_ALERT_RED, "%s", recordedLog_.error.c_str());
+        ImGui::End();
+        return;
+    }
+    if (recordedLog_.IsVirtual()) {
+        ImGui::TextColored(COLOR_ALERT_RED, "이 파일은 합성 데이터로 표시되어 실차 화면에서 열지 않습니다.");
+        ImGui::End();
+        return;
     }
 
-    if (recordedLog.IsVirtual())
-        ImGui::TextColored(COLOR_F1_YELLOW, "VIRTUAL RECORDED LOG | SYNTHETIC UID");
-    else
-        ImGui::TextColored(COLOR_F1_GREEN, "MEASURED HARDWARE LOG | DEVICE UID");
-    const std::string utf8Path = WideFieldToUtf8(recordedLog.filePath.c_str(), recordedLog.filePath.size());
-    ImGui::TextDisabled("FILE  %s", utf8Path.c_str());
-    ImGui::Separator();
-
-    ImGui::TextColored(COLOR_F1_CYAN, "LOG SUMMARY");
-    if (ImGui::BeginTable("LogSummary", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame)) {
+    const std::string path = WideFieldToUtf8(recordedLog_.filePath.c_str(), recordedLog_.filePath.size());
+    ImGui::TextColored(COLOR_OK_GREEN, "실측 장치 로그");
+    ImGui::TextDisabled("파일 %s", path.c_str());
+    if (ImGui::BeginTable("LogSummary", 4, kTableFlags)) {
         ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::TextDisabled("DURATION"); ImGui::Text("%.2f s", recordedLog.durationSeconds);
-        ImGui::TableNextColumn(); ImGui::TextDisabled("SAMPLES / RATE"); ImGui::Text("%zu / %.2f Hz", recordedLog.samples.size(), recordedLog.averageRateHz);
-        ImGui::TableNextColumn(); ImGui::TextDisabled("VALIDATION"); ImGui::TextColored(recordedLog.invalidPackets ? COLOR_FERRARI_RED : COLOR_F1_GREEN, "%zu invalid", recordedLog.invalidPackets);
-        ImGui::TableNextColumn(); ImGui::TextDisabled("VOLTAGE RANGE"); ImGui::Text("%.1f - %.1f V", recordedLog.minVoltage, recordedLog.maxVoltage);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("기록 시간"); ImGui::Text("%.2f s", recordedLog_.durationSeconds);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("샘플 / 주기"); ImGui::Text("%zu / %.2f Hz", recordedLog_.samples.size(), recordedLog_.averageRateHz);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("유효성"); ImGui::TextColored(recordedLog_.invalidPackets ? COLOR_ALERT_RED : COLOR_OK_GREEN, "%zu 오류", recordedLog_.invalidPackets);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("전압 범위"); ImGui::Text("%.1f ~ %.1f V", recordedLog_.minVoltage, recordedLog_.maxVoltage);
         ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::TextDisabled("DRIVE ENERGY"); ImGui::TextColored(COLOR_F1_YELLOW, "%.5f kWh", recordedLog.driveEnergyKWh);
-        ImGui::TableNextColumn(); ImGui::TextDisabled("REGEN ENERGY"); ImGui::TextColored(COLOR_F1_CYAN, "%.5f kWh", recordedLog.regenEnergyKWh);
-        ImGui::TableNextColumn(); ImGui::TextDisabled("NET ENERGY"); ImGui::Text("%.5f kWh", recordedLog.netEnergyKWh);
-        ImGui::TableNextColumn(); ImGui::TextDisabled("CURRENT RANGE"); ImGui::Text("%.1f - %.1f A", recordedLog.minCurrent, recordedLog.maxCurrent);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("구동 에너지"); ImGui::Text("%.5f kWh", recordedLog_.driveEnergyKWh);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("회생 에너지"); ImGui::Text("%.5f kWh", recordedLog_.regenEnergyKWh);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("순 에너지"); ImGui::Text("%.5f kWh", recordedLog_.netEnergyKWh);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("전류 범위"); ImGui::Text("%.1f ~ %.1f A", recordedLog_.minCurrent, recordedLog_.maxCurrent);
         ImGui::EndTable();
     }
 
-    ImGui::Spacing();
-    ImGui::SeparatorText("LOG TIMELINE");
-
-    const int maxIndex = static_cast<int>(recordedLog.samples.size()) - 1;
-    if (selectedLogSample > maxIndex) selectedLogSample = maxIndex;
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::SliderInt("##LogTimeline", &selectedLogSample, 0, maxIndex, "Sample %d");
-    const auto& sample = recordedLog.samples[static_cast<size_t>(selectedLogSample)];
-    ImGui::Text("POSITION  %d / %d", selectedLogSample + 1, maxIndex + 1);
-    ImGui::SameLine(250); ImGui::TextColored(COLOR_F1_CYAN, "TIME  %.3f s", sample.timestampMs / 1000.0f);
-
-    if (ImGui::BeginTable("SelectedSample", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame)) {
+    const int maxIndex = static_cast<int>(recordedLog_.samples.size()) - 1;
+    selectedLogSample_ = std::clamp(selectedLogSample_, 0, std::max(0, maxIndex));
+    ImGui::SliderInt("##LogTimeline", &selectedLogSample_, 0, std::max(0, maxIndex), "샘플 %d");
+    if (maxIndex < 0) {
+        ImGui::TextColored(COLOR_ALERT_RED, "표시할 샘플이 없습니다.");
+        ImGui::End();
+        return;
+    }
+    const auto& sample = recordedLog_.samples[static_cast<size_t>(selectedLogSample_)];
+    if (ImGui::BeginTable("LogSample", 5, kTableFlags)) {
         ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::TextDisabled("HV VOLTAGE"); ImGui::Text("%.1f V", sample.hvVoltage);
-        ImGui::TableNextColumn(); ImGui::TextDisabled("HV CURRENT"); ImGui::Text("%.1f A", sample.hvCurrent);
-        ImGui::TableNextColumn(); ImGui::TextDisabled("DC POWER"); ImGui::TextColored(sample.powerKW >= 0 ? COLOR_F1_YELLOW : COLOR_F1_CYAN, "%.1f kW", sample.powerKW);
-        ImGui::TableNextColumn(); ImGui::TextDisabled("LV SUPPLY"); ImGui::Text("%.2f V", sample.lvVoltage);
-        ImGui::TableNextColumn(); ImGui::TextDisabled("MCU TEMP"); ImGui::Text("%.2f C", sample.temperature);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("시간"); ImGui::Text("%.3f s", sample.timestampMs / 1000.0f);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("HV 전압"); ImGui::Text("%.1f V", sample.hvVoltage);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("HV 전류"); ImGui::Text("%.1f A", sample.hvCurrent);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("DC 전력"); ImGui::Text("%.1f kW", sample.powerKW);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("MCU 온도"); ImGui::Text("%.2f °C", sample.temperature);
         ImGui::EndTable();
     }
-
-    auto voltageGetter = [](void* data, int index) { return static_cast<EnergyLog*>(data)->samples[static_cast<size_t>(index)].hvVoltage; };
-    auto currentGetter = [](void* data, int index) { return static_cast<EnergyLog*>(data)->samples[static_cast<size_t>(index)].hvCurrent; };
-    auto powerGetter = [](void* data, int index) { return static_cast<EnergyLog*>(data)->samples[static_cast<size_t>(index)].powerKW; };
-    const int plotCount = static_cast<int>(recordedLog.samples.size());
-    ImGui::Spacing();
-    ImGui::SeparatorText("SYNCHRONIZED SIGNALS");
-    char voltageOverlay[64]; sprintf(voltageOverlay, "HV VOLTAGE | selected %.1f V", sample.hvVoltage);
-    char currentOverlay[64]; sprintf(currentOverlay, "HV CURRENT | selected %.1f A", sample.hvCurrent);
-    char powerOverlay[64]; sprintf(powerOverlay, "DC POWER | selected %.1f kW", sample.powerKW);
-    auto drawTimelineCursor = [&]() {
-        const ImVec2 plotMin = ImGui::GetItemRectMin();
-        const ImVec2 plotMax = ImGui::GetItemRectMax();
-        const float ratio = maxIndex > 0 ? static_cast<float>(selectedLogSample) / static_cast<float>(maxIndex) : 0.0f;
-        const float cursorX = plotMin.x + (plotMax.x - plotMin.x) * ratio;
-        ImDrawList* drawList = ImGui::GetWindowDrawList();
-        const ImU32 cursorColor = IM_COL32(255, 242, 0, 255);
-        drawList->AddLine(ImVec2(cursorX, plotMin.y + 2.0f), ImVec2(cursorX, plotMax.y - 2.0f), cursorColor, 2.0f);
-        drawList->AddTriangleFilled(
-            ImVec2(cursorX, plotMin.y + 2.0f),
-            ImVec2(cursorX - 5.0f, plotMin.y + 10.0f),
-            ImVec2(cursorX + 5.0f, plotMin.y + 10.0f),
-            cursorColor);
-    };
-    ImGui::PlotLines("##VoltagePlot", voltageGetter, &recordedLog, plotCount, 0, voltageOverlay, FLT_MAX, FLT_MAX, ImVec2(-1, 92));
-    drawTimelineCursor();
-    ImGui::PlotLines("##CurrentPlot", currentGetter, &recordedLog, plotCount, 0, currentOverlay, FLT_MAX, FLT_MAX, ImVec2(-1, 92));
-    drawTimelineCursor();
-    ImGui::PlotLines("##PowerPlot", powerGetter, &recordedLog, plotCount, 0, powerOverlay, FLT_MAX, FLT_MAX, ImVec2(-1, 92));
-    drawTimelineCursor();
-    ImGui::End();
-}
-
-void DashboardUI::RenderDriverInputs(SPageFilePhysics* p, bool isVirtual) {
-    ImGui::SetNextWindowPos(ImVec2(20, 220), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(380, 220), ImGuiCond_Once);
-    ImGui::Begin("DRIVER INPUTS & DRIVETRAIN", &showDriverInputWin, ImGuiWindowFlags_NoCollapse);
-
-    if (isVirtual) {
-        ImGui::TextColored(COLOR_F1_YELLOW, "VIRTUAL SIGNAL · ASSETTO CORSA");
-    } else {
-        ImGui::TextColored(COLOR_F1_GREEN, "MEASURED VEHICLE SIGNAL");
-    }
-    ImGui::Separator();
-
-    auto safePedal = [](float value) {
-        if (!std::isfinite(value)) return 0.0f;
-        if (value < 0.0f) return 0.0f;
-        if (value > 1.0f) return 1.0f;
-        return value;
-    };
-    const float gas = safePedal(p->gas);
-    const float brake = safePedal(p->brake);
-    // Assetto Corsa reports clutch engagement (1 = pedal released), while the
-    // dashboard shows pedal travel (0 = released, 100 = fully pressed).
-    const float clutch = 1.0f - safePedal(p->clutch);
-
-    ImGui::TextDisabled("THROTTLE [VIRTUAL]");
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, COLOR_F1_GREEN);
-    char throttleText[32]; sprintf(throttleText, "%.1f %%", gas * 100.0f);
-    ImGui::ProgressBar(gas, ImVec2(-1.0f, 18.0f), throttleText);
-    ImGui::PopStyleColor();
-
-    ImGui::TextDisabled("BRAKE [VIRTUAL]");
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, COLOR_FERRARI_RED);
-    char brakeText[32]; sprintf(brakeText, "%.1f %%", brake * 100.0f);
-    ImGui::ProgressBar(brake, ImVec2(-1.0f, 18.0f), brakeText);
-    ImGui::PopStyleColor();
-
-    ImGui::TextDisabled("CLUTCH [VIRTUAL]");
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, COLOR_F1_CYAN);
-    char clutchText[32]; sprintf(clutchText, "%.1f %%", clutch * 100.0f);
-    ImGui::ProgressBar(clutch, ImVec2(-1.0f, 18.0f), clutchText);
-    ImGui::PopStyleColor();
-
-    int gear = p->gear - 1;
-    char gearText[8];
-    if (gear == 0) strcpy(gearText, "N");
-    else if (gear < 0) strcpy(gearText, "R");
-    else sprintf(gearText, "%d", gear);
-
-    ImGui::Separator();
-    ImGui::SetWindowFontScale(1.65f);
-    ImGui::TextColored(COLOR_F1_YELLOW, "GEAR %s", gearText);
-    ImGui::SameLine(145.0f);
-    ImGui::TextColored(COLOR_F1_CYAN, "%d KM/H", static_cast<int>(p->speedKmh));
-    ImGui::SetWindowFontScale(1.0f);
-
-    float maxRpm = p->currentMaxRpm > 0 ? static_cast<float>(p->currentMaxRpm) : 12000.0f;
-    float rpmRatio = static_cast<float>(p->rpms) / maxRpm;
-    if (rpmRatio < 0.0f) rpmRatio = 0.0f;
-    if (rpmRatio > 1.0f) rpmRatio = 1.0f;
-    ImVec4 rpmColor = rpmRatio > 0.85f ? COLOR_FERRARI_RED : (rpmRatio > 0.65f ? COLOR_F1_YELLOW : COLOR_F1_GREEN);
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, rpmColor);
-    char rpmText[32]; sprintf(rpmText, "RPM %d / %.0f", p->rpms, maxRpm);
-    ImGui::ProgressBar(rpmRatio, ImVec2(-1.0f, 20.0f), rpmText);
-    ImGui::PopStyleColor();
-    ImGui::End();
-}
-
-void DashboardUI::RenderTyreMonitor(SPageFilePhysics* p) {
-    ImGui::SetNextWindowPos(ImVec2(20, 455), ImGuiCond_FirstUseEver);
-    ImGui::Begin("TYRE & BRAKE TELEMETRY", &showTyreWin, ImGuiWindowFlags_AlwaysAutoResize);
-    ImGui::TextColored(COLOR_F1_YELLOW, "VIRTUAL SIGNAL · ASSETTO CORSA");
-    ImGui::Separator();
-    
-    if (ImGui::BeginTable("TyreTable", 2)) {
-        const char* labels[] = {"FRONT LEFT", "FRONT RIGHT", "REAR LEFT", "REAR RIGHT"};
-        for(int i = 0; i < 4; i++) {
-            ImGui::TableNextColumn();
-            ImGui::BeginChild(labels[i], ImVec2(180, 160), true);
-            ImGui::TextColored(COLOR_F1_CYAN, "%s", labels[i]); 
-            ImGui::Separator();
-            
-            float coreTemp = p->tyreCoreTemperature[i];
-            ImGui::Text("Core: "); ImGui::SameLine();
-            ImGui::TextColored(GetTempColor(coreTemp), "%.1f C", coreTemp);
-            
-            ImGui::Text("I/M/O: %.0f / %.0f / %.0f", p->tyreTempI[i], p->tyreTempM[i], p->tyreTempO[i]);
-            ImGui::Text("Press: %.1f psi", p->wheelsPressure[i]);
-            
-            ImGui::Separator();
-            float brakeTemp = p->brakeTemp[i];
-            ImGui::Text("Brake: "); ImGui::SameLine();
-            ImGui::TextColored(GetTempColor(brakeTemp), "%.0f C", brakeTemp);
-            
-            ImGui::EndChild(); 
-        }
-        ImGui::EndTable();
-    }
-    ImGui::End();
-}
-
-void DashboardUI::RenderTiming(SPageFileGraphics* curG) {
-    ImGui::SetNextWindowPos(ImVec2(420, 20), ImGuiCond_FirstUseEver);
-    ImGui::Begin("TIMING & DELTA", &showTimingWin, ImGuiWindowFlags_AlwaysAutoResize);
-    ImGui::TextColored(COLOR_F1_YELLOW, "VIRTUAL SIGNAL · ASSETTO CORSA");
-    ImGui::Separator();
-    
-    ImGui::SetWindowFontScale(1.5f);
-    const std::string best = WideFieldToUtf8(curG->bestTime, 15);
-    const std::string last = WideFieldToUtf8(curG->lastTime, 15);
-    ImGui::TextColored(COLOR_F1_PURPLE, "BEST: %s", best.c_str());
-    ImGui::Text("LAST: %s", last.c_str());
-    ImGui::SetWindowFontScale(1.0f);
-    ImGui::Separator();
-    
-    if (ImGui::BeginTable("SectorTable", 3)) {
-        for(int i = 0; i < 3; i++) { 
-            ImGui::TableNextColumn();
-            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "SECTOR %d", i + 1); 
-            ImGui::SetWindowFontScale(1.8f);
-            ImGui::TextColored(sectorTiming.colors[i], "%.3f", sectorTiming.lastTime[i]); 
-            ImGui::SetWindowFontScale(1.0f);
-        }
-        ImGui::EndTable();
-    }
-    
-    ImGui::Separator();
-    ImGui::Text("LAPS: %d", curG->completedLaps);
-    ImGui::SameLine(120);
-    ImGui::Text("POS: %d", curG->position);
-    
-    ImGui::End();
-}
-
-void DashboardUI::RenderTrackMap(SPageFilePhysics* p) {
-    ImGui::SetNextWindowPos(ImVec2(420, 200), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(400, 350), ImGuiCond_FirstUseEver);
-    ImGui::Begin("TRACK MAP GPS", &showMapWin);
-    ImGui::TextColored(COLOR_F1_YELLOW, "VIRTUAL SIGNAL · ASSETTO CORSA");
-    
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 p0 = ImGui::GetCursorScreenPos(); 
-    ImVec2 sz = ImGui::GetContentRegionAvail();
-    
-    dl->AddRectFilled(p0, ImVec2(p0.x + sz.x, p0.y + sz.y), IM_COL32(15, 15, 15, 255));
-    
-    ImVec2 cp = ImVec2(p->tyreContactPoint[0][0], p->tyreContactPoint[0][2]);
-    
-    if (trackTrail.empty() || hypotf(trackTrail.back().x - cp.x, trackTrail.back().y - cp.y) > 5.0f) { 
-        trackTrail.push_back(cp); 
-        if(trackTrail.size() > 1500) trackTrail.pop_front(); 
-    }
-    
-    ImVec2 center = ImVec2(p0.x + sz.x * 0.5f, p0.y + sz.y * 0.5f); 
-    float sc = 0.12f;
-    
-    for(size_t i = 0; i + 1 < trackTrail.size(); i++) {
-        dl->AddLine(
-            ImVec2(center.x + trackTrail[i].x * sc, center.y + trackTrail[i].y * sc), 
-            ImVec2(center.x + trackTrail[i+1].x * sc, center.y + trackTrail[i+1].y * sc), 
-            IM_COL32(150, 150, 150, 150), 2.0f
-        );
-    }
-    
-    dl->AddCircleFilled(ImVec2(center.x + cp.x * sc, center.y + cp.y * sc), 6.0f, IM_COL32(227, 38, 54, 255));
+    auto voltage = [](void* data, int i) { return static_cast<EnergyLog*>(data)->samples[static_cast<size_t>(i)].hvVoltage; };
+    auto current = [](void* data, int i) { return static_cast<EnergyLog*>(data)->samples[static_cast<size_t>(i)].hvCurrent; };
+    auto power = [](void* data, int i) { return static_cast<EnergyLog*>(data)->samples[static_cast<size_t>(i)].powerKW; };
+    const int count = static_cast<int>(recordedLog_.samples.size());
+    ImGui::PlotLines("HV 전압", voltage, &recordedLog_, count, 0, nullptr, FLT_MAX, FLT_MAX, ImVec2(-1, 120));
+    ImGui::PlotLines("HV 전류", current, &recordedLog_, count, 0, nullptr, FLT_MAX, FLT_MAX, ImVec2(-1, 120));
+    ImGui::PlotLines("DC 전력", power, &recordedLog_, count, 0, nullptr, FLT_MAX, FLT_MAX, ImVec2(-1, 120));
     ImGui::End();
 }

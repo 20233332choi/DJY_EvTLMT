@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiUdp.h>
+#include <esp32-hal-rgb-led.h>
 #include <driver/twai.h>
 
 #include "config.h"
@@ -49,7 +50,25 @@
 #define EV_RELAY_ACCEPT_COMMANDS 0
 #endif
 
-#if EV_RELAY_ENABLED && EV_RELAY_ACCEPT_COMMANDS && EV_RELAY_ALLOW_INSECURE_TLS
+#ifndef EV_ALLOW_INSECURE_RELAY_COMMANDS
+#define EV_ALLOW_INSECURE_RELAY_COMMANDS 0
+#endif
+
+#ifndef EV_ALLOW_PLAINTEXT_RELAY
+#define EV_ALLOW_PLAINTEXT_RELAY 0
+#endif
+
+#ifndef EV_STATUS_LED_ENABLED
+#define EV_STATUS_LED_ENABLED 1
+#endif
+
+#ifndef EV_STATUS_LED_GPIO
+// Some ESP32-S3 DevKitC-1 boards cannot drive the GPIO48 NeoPixel data line
+// high enough. Jumper GPIO38 to GPIO48, then drive the RGB LED through GPIO38.
+#define EV_STATUS_LED_GPIO 38
+#endif
+
+#if EV_RELAY_ENABLED && EV_RELAY_ACCEPT_COMMANDS && EV_RELAY_ALLOW_INSECURE_TLS && !EV_ALLOW_INSECURE_RELAY_COMMANDS
 #error "Internet vehicle commands require verified TLS; do not combine command RX with insecure TLS"
 #endif
 
@@ -87,6 +106,18 @@ DjyUartLiveTv liveCommand = {};
 bool liveCommandSeen = false;
 uint32_t liveCommandMs = 0;
 
+bool jsonStringEquals(const String& input, const char* key, const char* expected) {
+    const String marker = String('"') + key + "\":";
+    int start = input.indexOf(marker);
+    if (start < 0) return false;
+    start += marker.length();
+    while (start < input.length() && input[start] == ' ') ++start;
+    if (start >= input.length() || input[start] != '"') return false;
+    ++start;
+    const int end = input.indexOf('"', start);
+    return end >= start && input.substring(start, end) == expected;
+}
+
 #if EV_RELAY_ENABLED
 portMUX_TYPE relayMux = portMUX_INITIALIZER_UNLOCKED;
 char relayTelemetry[1536] = {};
@@ -96,6 +127,10 @@ bool relayCommandPending = false;
 uint32_t relayTxCount = 0;
 uint32_t relayErrorCount = 0;
 uint32_t relayCommandCount = 0;
+int relayLastHttpStatus = 0;
+int relayDnsStatus = 0;
+int relayTcp443Status = 0;
+int relayTlsError = 0;
 
 void stageRelayTelemetry(const char* json) {
     portENTER_CRITICAL(&relayMux);
@@ -106,7 +141,9 @@ void stageRelayTelemetry(const char* json) {
 
 void stageRelayCommand(const String& response) {
 #if EV_RELAY_ACCEPT_COMMANDS
-    if (response.indexOf("\"command\":{") < 0 || response.indexOf("\"type\":\"") < 0) return;
+    if (!jsonStringEquals(response, "type", "live_tv") &&
+        !jsonStringEquals(response, "type", "pit_config") &&
+        !jsonStringEquals(response, "type", "relay_ping")) return;
     portENTER_CRITICAL(&relayMux);
     strlcpy(relayCommand, response.c_str(), sizeof(relayCommand));
     relayCommandPending = true;
@@ -120,29 +157,54 @@ void stageRelayCommand(const String& response) {
 void relayTask(void*) {
     const String relayUrl(EV_RELAY_URL);
     const String relayToken(EV_RELAY_TOKEN);
-    if (!relayUrl.startsWith("https://") || relayToken.length() < 16u) {
-        Serial.println("# HTTPS relay disabled: configure URL and a token of at least 16 characters");
+    const bool relayUsesTls = relayUrl.startsWith("https://");
+    const bool relayUsesPlaintext = relayUrl.startsWith("http://");
+    if ((!relayUsesTls && !relayUsesPlaintext) || relayToken.length() < 16u) {
+        Serial.println("# Internet relay disabled: configure URL and a token of at least 16 characters");
+        vTaskDelete(nullptr);
+        return;
+    }
+    if (relayUsesPlaintext && !EV_ALLOW_PLAINTEXT_RELAY) {
+        Serial.println("# HTTP relay disabled: set EV_ALLOW_PLAINTEXT_RELAY for bench use");
         vTaskDelete(nullptr);
         return;
     }
 
-    WiFiClientSecure secureClient;
-#if defined(EV_RELAY_CA_CERT)
-    secureClient.setCACert(EV_RELAY_CA_CERT);
-#elif EV_RELAY_ALLOW_INSECURE_TLS
-    secureClient.setInsecure();
-#else
-    Serial.println("# HTTPS relay disabled: configure EV_RELAY_CA_CERT");
-    vTaskDelete(nullptr);
-    return;
-#endif
+    const int authorityStart = relayUrl.indexOf("//") + 2;
+    const int pathStart = relayUrl.indexOf('/', authorityStart);
+    String relayAuthority = pathStart >= 0 ? relayUrl.substring(authorityStart, pathStart)
+                                           : relayUrl.substring(authorityStart);
+    uint16_t relayPort = relayUsesTls ? 443 : 80;
+    const int portMarker = relayAuthority.lastIndexOf(':');
+    if (portMarker > 0) {
+        relayPort = static_cast<uint16_t>(relayAuthority.substring(portMarker + 1).toInt());
+        relayAuthority = relayAuthority.substring(0, portMarker);
+    }
 
     uint32_t sentVersion = 0;
-    uint32_t retryMs = 250;
+    uint32_t retryMs = 1000;
+    bool networkPathChecked = false;
     for (;;) {
         if (WiFi.status() != WL_CONNECTED) {
+            networkPathChecked = false;
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
+        }
+
+        if (!networkPathChecked) {
+            IPAddress relayAddress;
+            const int dnsOk = WiFi.hostByName(relayAuthority.c_str(), relayAddress) == 1 ? 1 : -1;
+            int tcpOk = 0;
+            if (dnsOk == 1) {
+                WiFiClient tcpProbe;
+                tcpOk = tcpProbe.connect(relayAddress, relayPort, 5000) == 1 ? 1 : -1;
+                tcpProbe.stop();
+            }
+            portENTER_CRITICAL(&relayMux);
+            relayDnsStatus = dnsOk;
+            relayTcp443Status = tcpOk;
+            portEXIT_CRITICAL(&relayMux);
+            networkPathChecked = true;
         }
 
         char payload[1536];
@@ -156,16 +218,45 @@ void relayTask(void*) {
             continue;
         }
 
+        // Baja relay compatibility: one DNS/TCP/TLS/HTTP exchange per socket.
+        // ngrok can acknowledge keep-alive while delaying a reused TLS socket.
+        WiFiClient plainClient;
+        WiFiClientSecure secureClient;
+        WiFiClient* relayClient = relayUsesTls ? static_cast<WiFiClient*>(&secureClient) : &plainClient;
+        if (relayUsesTls) {
+#if defined(EV_RELAY_CA_CERT)
+            secureClient.setCACert(EV_RELAY_CA_CERT);
+#elif EV_RELAY_ALLOW_INSECURE_TLS
+            secureClient.setInsecure();
+#else
+            Serial.println("# HTTPS relay disabled: configure EV_RELAY_CA_CERT");
+            vTaskDelete(nullptr);
+            return;
+#endif
+            secureClient.setHandshakeTimeout(15);
+        }
+
         HTTPClient http;
         http.useHTTP10(true);
-        http.setTimeout(3000);
+        http.setReuse(false);
+        http.setConnectTimeout(15000);
+        http.setTimeout(15000);
         bool success = false;
-        if (http.begin(secureClient, relayUrl)) {
+        if (http.begin(*relayClient, relayUrl)) {
             http.addHeader("Content-Type", "application/json");
             http.addHeader("Authorization", String("Bearer ") + relayToken);
             http.addHeader("X-Vehicle-ID", EV_VEHICLE_ID);
             http.addHeader("ngrok-skip-browser-warning", "1");
+            http.addHeader("Connection", "close");
             const int status = http.POST(reinterpret_cast<uint8_t*>(payload), strlen(payload));
+            char tlsErrorText[96] = {};
+            const int tlsError = relayUsesTls && status < 0
+                                     ? secureClient.lastError(tlsErrorText, sizeof(tlsErrorText))
+                                     : 0;
+            portENTER_CRITICAL(&relayMux);
+            relayLastHttpStatus = status;
+            relayTlsError = tlsError;
+            portEXIT_CRITICAL(&relayMux);
             if (status >= 200 && status < 300) {
                 const String response = http.getString();
                 stageRelayCommand(response);
@@ -173,23 +264,81 @@ void relayTask(void*) {
                 portENTER_CRITICAL(&relayMux);
                 ++relayTxCount;
                 portEXIT_CRITICAL(&relayMux);
-                retryMs = 250;
+                retryMs = 1000;
                 success = true;
             }
             http.end();
+        } else {
+            portENTER_CRITICAL(&relayMux);
+            relayLastHttpStatus = -1000;
+            portEXIT_CRITICAL(&relayMux);
         }
+        relayClient->stop();
         if (!success) {
             portENTER_CRITICAL(&relayMux);
             ++relayErrorCount;
             portEXIT_CRITICAL(&relayMux);
             vTaskDelay(pdMS_TO_TICKS(retryMs));
-            retryMs = retryMs < 2500u ? retryMs * 2u : 5000u;
+            retryMs = min(retryMs * 2u, 5000u);
         } else {
-            vTaskDelay(pdMS_TO_TICKS(80));
+            // A fresh TCP connection per exchange is ngrok-compatible, but
+            // cap it near 4 Hz to avoid exhausting free-tunnel connection rate.
+            vTaskDelay(pdMS_TO_TICKS(250));
         }
     }
 }
 #endif
+
+void setStatusLed(uint8_t red, uint8_t green, uint8_t blue) {
+#if EV_STATUS_LED_ENABLED
+    neopixelWrite(EV_STATUS_LED_GPIO, red, green, blue);
+#else
+    (void)red;
+    (void)green;
+    (void)blue;
+#endif
+}
+
+void runStatusLedSelfTest() {
+#if EV_STATUS_LED_ENABLED
+    setStatusLed(255, 0, 0);
+    delay(350);
+    setStatusLed(0, 255, 0);
+    delay(350);
+    setStatusLed(0, 0, 255);
+    delay(350);
+    setStatusLed(0, 0, 0);
+#endif
+}
+
+void updateStatusLed() {
+#if EV_STATUS_LED_ENABLED
+    const uint32_t now = millis();
+    static uint32_t previous = 0;
+    if (now - previous < 100u) return;
+    previous = now;
+
+    const bool blink = (now / 500u) % 2u == 0u;
+    if (WiFi.status() != WL_CONNECTED) {
+        setStatusLed(0, 0, blink ? 64 : 0);  // Blue: joining hotspot.
+        return;
+    }
+
+#if EV_RELAY_ENABLED
+    uint32_t relayTx = 0;
+    portENTER_CRITICAL(&relayMux);
+    relayTx = relayTxCount;
+    portEXIT_CRITICAL(&relayMux);
+    if (relayTx > 0u) {
+        setStatusLed(0, 64, 0);  // Green: live HTTPS telemetry upload.
+    } else {
+        setStatusLed(blink ? 64 : 0, blink ? 32 : 0, 0);  // Yellow: relay retrying.
+    }
+#else
+    setStatusLed(0, 48, 48);  // Cyan: local Wi-Fi/UDP mode only.
+#endif
+#endif
+}
 
 float throttlePercent() {
     if (state.tpsReportedPct >= 0) return static_cast<float>(state.tpsReportedPct);
@@ -441,9 +590,9 @@ void forwardLiveTvCommand() {
 }
 
 void handleCommand(const String& input) {
-    if (input.indexOf("\"type\":\"live_tv\"") >= 0) {
+    if (jsonStringEquals(input, "type", "live_tv")) {
         acceptLiveTvCommand(input);
-    } else if (input.indexOf("\"type\":\"pit_config\"") >= 0) {
+    } else if (jsonStringEquals(input, "type", "pit_config")) {
         sendPitConfig(input);
     }
 }
@@ -495,11 +644,16 @@ void publishTelemetry() {
                          tvLimited ? "PIT_LIMIT_OR_RAMP" : "NONE";
 
     uint32_t relayTx = 0, relayErrors = 0, relayCommands = 0;
+    int relayHttpStatus = 0, relayDns = 0, relayTcp443 = 0, relayTls = 0;
 #if EV_RELAY_ENABLED
     portENTER_CRITICAL(&relayMux);
     relayTx = relayTxCount;
     relayErrors = relayErrorCount;
     relayCommands = relayCommandCount;
+    relayHttpStatus = relayLastHttpStatus;
+    relayDns = relayDnsStatus;
+    relayTcp443 = relayTcp443Status;
+    relayTls = relayTlsError;
     portEXIT_CRITICAL(&relayMux);
 #endif
     char json[1536];
@@ -517,7 +671,9 @@ void publishTelemetry() {
         "\"rear_uart_rx\":%lu,\"rear_uart_errors\":%lu,\"limit_reason\":\"%s\","
         "\"command_source\":\"%s\",\"live_control_allowed\":%s,"
         "\"wifi_connected\":%s,\"wifi_rssi_dbm\":%ld,\"internet_relay_enabled\":%s,"
-        "\"internet_relay_tx\":%lu,\"internet_relay_errors\":%lu,\"internet_relay_commands\":%lu}",
+        "\"internet_relay_tx\":%lu,\"internet_relay_errors\":%lu,\"internet_relay_commands\":%lu,"
+        "\"internet_relay_last_http_status\":%d,\"internet_relay_dns_ok\":%d,"
+        "\"internet_relay_tcp443_ok\":%d,\"internet_relay_tls_error\":%d}",
         static_cast<unsigned long>(state.sequence), static_cast<unsigned long>(millis()),
         state.rpmLeft, state.rpmRight, speedKmh(), state.tpsRaw, throttlePercent(), state.dacLeft, state.dacRight,
         tpsOk ? "true" : "false", state.sasRaw, kSasCenterRaw, sasAbsoluteDeg(),
@@ -540,7 +696,7 @@ void publishTelemetry() {
         WiFi.status() == WL_CONNECTED ? static_cast<long>(WiFi.RSSI()) : -127L,
         EV_RELAY_ENABLED ? "true" : "false",
         static_cast<unsigned long>(relayTx), static_cast<unsigned long>(relayErrors),
-        static_cast<unsigned long>(relayCommands));
+        static_cast<unsigned long>(relayCommands), relayHttpStatus, relayDns, relayTcp443, relayTls);
 
     if (EV_LOCAL_UDP_ENABLED && WiFi.status() == WL_CONNECTED) {
         telemetryUdp.beginPacket(pitHost, EV_TELEMETRY_PORT);
@@ -560,6 +716,7 @@ void setup() {
     Serial.begin(115200);
     Serial.setTimeout(10);
     Serial.println("# DJY ESP gateway boot");
+    runStatusLedSelfTest();
     pinMode(EV_PIT_ENABLE_GPIO, INPUT_PULLUP);
 
     if (EV_REAR_UART_MODE) {
@@ -583,6 +740,7 @@ void setup() {
     WiFi.begin(EV_WIFI_SSID, EV_WIFI_PASSWORD);
     pitHost.fromString(EV_PIT_HOST);
     commandUdp.begin(EV_COMMAND_PORT);
+    setStatusLed(0, 0, 64);
 #if EV_RELAY_ENABLED
     xTaskCreatePinnedToCore(relayTask, "ev-https-relay", 12288, nullptr, 1, nullptr, 0);
 #endif
@@ -595,6 +753,7 @@ void loop() {
     receiveCommands();
     forwardLiveTvCommand();
     sendEspStatus();
+    updateStatusLed();
     publishTelemetry();
     delay(1);
 }

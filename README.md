@@ -1,31 +1,22 @@
 # DJY EV Telemetry
 
-Assetto Corsa 가상 텔레메트리와 실제 EV 에너지미터 데이터를 서로 분리해 표시하는
-Windows C++ 대시보드입니다. GUI는 CMake, Dear ImGui, Win32, DirectX 11로 구성됩니다.
+STM32F, STM32R, ESP32-S3, DALY BMS 및 GNSS에서 들어오는 실제 차량 데이터를 표시하는
+Windows C++ 피트 대시보드입니다. GUI는 CMake, Dear ImGui, Win32, DirectX 11로 구성됩니다.
+가상 주행 신호, 내장 데모 및 Assetto Corsa 데이터 소스는 사용하지 않습니다.
 
-이 프로젝트는 [ASC_TLMTSYS](https://github.com/20233332choi/ASC_TLMTSYS.git)에서 파생되었습니다.
+전체 통신 구조와 안전 경계는
+[EV 차량/피트 텔레메트리 구조](docs/EV_ARCHITECTURE.md)를 참고하십시오.
 
-## 화면
+## 기본 실행
 
-### 실시간 텔레메트리
-
-가상 신호와 실제 하드웨어 신호를 별도 창으로 분리하고, 드라이버 입력·타이어·브레이크·랩타임·트랙 맵·에너지 정보를 실시간으로 표시합니다.
-
-![DJY EV Telemetry 실시간 대시보드](docs/assets/live-dashboard.png)
-
-### 에너지 로그 열람
-
-FSK-EEM 호환 로그의 요약값, 선택 샘플, 전압·전류·전력 파형과 타임라인 위치를 한 화면에서 확인합니다.
-
-![DJY EV Telemetry 기록 열람 창](docs/assets/recorded-energy-log.png)
-
-## 실행
-
-프로젝트 루트의 다음 파일을 더블클릭합니다.
+프로젝트 루트에서 다음 파일을 실행합니다.
 
 ```text
 run_dashboard.bat
 ```
+
+대시보드는 기본적으로 Gateway의 실차 JSON을 UDP `9004`에서 기다립니다. 패킷이 없으면
+임의값을 만들지 않고 각 항목에 `--` 또는 `수신 대기`를 표시합니다.
 
 실행 파일이 없으면 Visual Studio CMake로 자동 빌드합니다. 강제로 다시 빌드하려면:
 
@@ -33,80 +24,87 @@ run_dashboard.bat
 .\run_dashboard.bat rebuild
 ```
 
-## 데이터 구분
+Gateway 없이 ESP32의 로컬 UDP `9003`을 직접 받을 때만 다음 모드를 사용합니다.
 
-- `VIRTUAL SIGNAL`: Assetto Corsa 공유 메모리 또는 내장 데모에서 계산한 추정값
-- `REAL HARDWARE SIGNAL`: 향후 CAN/UART로 수신할 실제 회로 계측값
-- 게임 패킷이 1.5초 이상 갱신되지 않으면 `OFFLINE`
-- 실제 창에는 가상값을 복사하지 않으며 미연결 시 `--`를 표시
-
-현재 실제 `fsk-energymeter` 펌웨어는 주행 중 SD 기록만 수행하므로, 실제 창의 실시간
-표시에는 별도의 CAN/UART 송신 펌웨어와 수신 인터페이스가 필요합니다.
-
-## 가상 로그 자동 기록
-
-대시보드는 Assetto Corsa의 `AC_LIVE` 패킷을 감지하면 실제 FSK-EEM과 동일한 16-byte
-레코드 형식으로 자동 기록합니다.
-
-```text
-data/dummy/VIRTUAL_AC_YYYYMMDD_HHMMSS.log
+```powershell
+.\run_dashboard.bat ev-direct
 ```
 
-- 별도 기록 스레드에서 10 ms 간격(100 Hz)으로 기록
-- 10개 레코드마다 파일 flush(약 100 ms)
-- AC 세션 시작 시 새 로그 생성
-- 세션 종료 상태가 3초 지속되면 로그 종료
-- 실제 FSK-EEM과 동일한 magic, timestamp, 단위, XOR checksum 사용
-- 합성 UID를 사용하므로 열람 창에서 `VIRTUAL RECORDED LOG`로 판별
-- `OPEN LATEST DUMMY` 버튼으로 현재/최근 가상 로그 열기
+## BMS 벤치 연결
 
-프로그램이 종료될 때도 열린 로그를 flush하고 닫습니다. `data/dummy/*.log`는 생성 데이터라
-Git에서 제외됩니다.
+현재 DALY R24TS를 USB-UART로 PC에 직접 연결하여 확인할 때는 다음 파일을 실행합니다.
+
+```powershell
+.\run_bms_pit_dashboard.bat
+```
+
+Gateway가 BMS 데이터와 차량 텔레메트리를 병합해 UDP `9004`로 전달합니다. BMS 드라이버는
+공개 텔레메트리 ID `0x90~0x98`만 요청하며 설정 변경과 MOS 제어 명령은 구현하지 않습니다.
+
+향후 BMS를 ESP32 UART2에 연결해 무선으로 전달할 때도 `battery_pack_voltage_v`,
+`battery_current_a`, `battery_soc_pct`, `bms_cell_voltages_v`, `bms_*` 필드를 그대로 사용합니다.
+
+## 대시보드 창
+
+| 창 | 실제 입력 | 역할 |
+|---|---|---|
+| 시스템 상태 | Gateway/ESP/STM/BMS/GNSS 상태 | 연결 상태와 실제로 존재하는 창만 선택 |
+| 차량 실시간 센서 | STM32F/STM32R | 속도, 모터 RPM, TPS, SAS, IMU, TQV/회생 상태 |
+| 배터리 / DALY BMS | BMS | 팩 상태, MOS/알람, 셀별 전압과 평균 대비 편차 |
+| GNSS 트랙맵 | 향후 GNSS 수신기 | 실제 위도/경도 기반 주행 궤적과 Fix 품질 |
+| TQV / 회생제동 피트 설정 | 안전 게이트가 허용한 명령 경로 | 링크 시험, 제한값 및 임시 설정 |
+| 실측 에너지 로그 | FSK-EEM `.log` | 체크섬 검증, 샘플과 전압·전류·전력 파형 |
+
+TQV/회생 설정 창은 기본적으로 닫혀 있습니다. 실행 중인 Gateway가 제어를 명시적으로
+허용하고 차량의 물리 안전 조건을 통과해야만 전송 버튼이 활성화됩니다.
+
+## GNSS 입력 계약
+
+ESP32 또는 Gateway가 다음 JSON 필드를 UDP 패킷에 포함하면 트랙맵이 자동으로 실제 궤적을
+누적합니다. 좌표가 없을 때는 빈 지도와 연결 대기 상태만 표시합니다.
+
+```json
+{
+  "gnss_online": true,
+  "gnss_fix_type": 3,
+  "gnss_satellites": 12,
+  "gnss_latitude_deg": 37.1234567,
+  "gnss_longitude_deg": 127.1234567,
+  "gnss_altitude_m": 42.5,
+  "gnss_heading_deg": 181.2,
+  "gnss_hdop": 0.8,
+  "gnss_age_ms": 120
+}
+```
+
+위도/경도는 `double` 정밀도로 보관하고, 첫 유효 위치를 원점으로 변환해 미터 단위 궤적을
+그립니다. 수신 지연이 2초를 넘으면 새 궤적을 추가하지 않습니다.
 
 ## 프로젝트 구조
 
 ```text
 DJY_EvTLMT/
 ├─ CMakeLists.txt
-├─ run_dashboard.bat        # 사용자 원클릭 실행
-├─ README.md
+├─ run_dashboard.bat
 ├─ src/
 │  ├─ main.cpp
-│  ├─ ui/                   # ImGui 대시보드 화면
-│  └─ telemetry/            # AC 공유 메모리와 통신 데이터 소스
+│  ├─ ui/                   # 실차 전용 ImGui 화면
+│  └─ telemetry/            # EV UDP 수신, BMS/GNSS 스키마, 실측 로그
+├─ gateway/                 # 유선/무선 차량 패킷 병합 및 UDP 9004 전달
+├─ firmware/
+│  └─ esp32_ev_gateway/     # STM32/BMS → Wi-Fi/USB Gateway
 ├─ scripts/
-│  └─ build.ps1             # 개발용 CMake 빌드
 ├─ docs/
-│  └─ CAN_INTEGRATION.md
-├─ third_party/
-│  ├─ imgui/                # 빌드에 필요한 Dear ImGui 파일만 포함
-│  └─ json/                 # nlohmann single-header JSON
-├─ data/
-│  └─ dummy/                # 자동 생성되는 가상 FSK-EEM 로그
+└─ third_party/
 ```
 
-`build/`와 `bin/`은 자동 생성되며 Git에서 제외됩니다.
+## 안전 경계
 
-## 대시보드 창
+- ESP32 또는 대시보드가 고장 나도 STM32F/STM32R의 차량 제어가 독립적으로 유지되어야 합니다.
+- BMS 연동은 읽기 전용이며 대시보드에서 MOS 설정 명령을 보내지 않습니다.
+- 회생 적용값은 BMS 제한, 브레이크 입력 타당성 및 모터 컨트롤러 연동 검증 전까지 0입니다.
+- 피트 제어는 읽기 전용이 기본이며 PIT ENABLE, 정차, TPS/RPM 및 오류 조건을 우회하지 않습니다.
 
-- Driver Inputs & Drivetrain `[VIRTUAL]`
-- EV Energy `[VIRTUAL]`
-- Tyre & Brake `[VIRTUAL]`
-- Timing `[VIRTUAL]`
-- Track Map `[VIRTUAL]`
-- Real Hardware Energy
-- Recorded Energy Log
-
-컨트롤 창의 체크박스는 위 정보창과 1:1로 대응합니다.
-
-`Recorded Energy Log` 창은 FSK-EEM `.log`의 체크섬을 검증하고 전압·전류·전력 파형,
-선택 샘플, 소비·회생·순에너지와 손상 패킷 수를 표시합니다. 합성 UID 로그는
-`VIRTUAL RECORDED LOG`, 실제 장치 UID 로그는 `MEASURED HARDWARE LOG`로 구분합니다.
-
-## 실제 CAN 연동
-
-CAN 하드웨어, 메시지 ID, 스케일, 상태 판정, 배선 및 펌웨어 요구사항은
+인터넷 릴레이는 [ESP32 차량 인터넷 릴레이](docs/INTERNET_RELAY.md), TQV/회생 상세는
+[TQV·회생제동 STM–ESP–피트 연동](docs/TQV_REGEN_INTEGRATION.md), CAN 계측기 연동은
 [CAN 연동 문서](docs/CAN_INTEGRATION.md)를 참고하십시오.
-
-> 대회에서 지급하거나 공식 판정에 사용하는 에너지미터의 펌웨어와 회로는 임의로
-> 변경하지 마십시오. CAN 수정은 자작 계측기 또는 별도 보조 계측기에만 적용합니다.

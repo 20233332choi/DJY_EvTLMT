@@ -2,16 +2,16 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <tchar.h>
-#include <iostream>
+#include <memory>
+#include <cstring>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
 #include "DataSource.h"
+#include "EVDataSource.h"
 #include "DashboardUI.h"
-#include "TelemetrySender.h"
-#include "VirtualLogRecorder.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -52,25 +52,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f);
+    ImFont* koreanFont = io.Fonts->AddFontFromFileTTF(
+        "C:\\Windows\\Fonts\\malgun.ttf", 18.0f, nullptr, io.Fonts->GetGlyphRangesKorean());
+    if (!koreanFont) {
+        io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\segoeui.ttf", 18.0f, nullptr, io.Fonts->GetGlyphRangesKorean());
+    }
     
     ImGui_ImplWin32_Init(hWnd); 
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
     // Initialization of Application Logic
-    LocalMemorySource localSource;
-    DemoSource demoSource;
+    const char* commandLine = lpCmdLine ? lpCmdLine : "";
+    const bool evDirectMode = std::strstr(commandLine, "--ev-direct") != nullptr;
+    auto evSource = std::make_unique<EVDataSource>(evDirectMode ? 9003 : 9004);
     DashboardUI dashboardUI;
-    TelemetrySender telemetrySender;
-    VirtualLogRecorder virtualRecorder;
-    virtualRecorder.Start();
-    dashboardUI.SetVirtualRecorder(&virtualRecorder);
-    
-    // We don't need to send data from this dashboard anymore, it's a receiver.
-    // telemetrySender.Init("127.0.0.1", 8001);
-    dashboardUI.enableWebBroadcast = false; // Default OFF for Pit Wall
-    
-    bool demoMode = false;
     bool done = false;
 
     while (!done) {
@@ -87,20 +83,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ImGui::NewFrame();
 
         // Update Data Source
-        IDataSource* activeSource = &localSource;
-        if (demoMode) {
-            activeSource = &demoSource;
-        }
-        
-        activeSource->Update(io.DeltaTime);
+        evSource->Update(io.DeltaTime);
 
         // Render UI
-        dashboardUI.Render(activeSource, demoMode);
-        
-        // Broadcast Data if enabled
-        if (dashboardUI.enableWebBroadcast && activeSource->IsConnected()) {
-            telemetrySender.SendData(activeSource->GetPhysics(), activeSource->GetGraphics(), activeSource->GetStatic());
-        }
+        dashboardUI.Render(evSource.get());
 
         // Rendering DirectX
         ImGui::Render();
@@ -112,7 +98,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     // --- Proper Cleanup ---
-    virtualRecorder.Stop();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

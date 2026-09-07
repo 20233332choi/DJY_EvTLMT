@@ -9,9 +9,8 @@ set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui")
 add_executable(DJY_EvTLMT WIN32
     src/main.cpp
     src/ui/DashboardUI.cpp
-    src/telemetry/TelemetrySender.cpp
+    src/telemetry/EVDataSource.cpp
     src/telemetry/EnergyLog.cpp
-    src/telemetry/VirtualLogRecorder.cpp
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
     ${IMGUI_DIR}/imgui_tables.cpp
