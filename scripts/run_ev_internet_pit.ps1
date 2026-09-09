@@ -52,6 +52,9 @@ if ($relayToken.Length -lt 16) {
 if ($EnableControl -and (Get-IntegerDefine 'EV_RELAY_ACCEPT_COMMANDS') -ne 1) {
     throw 'Remote commands were requested, but EV_RELAY_ACCEPT_COMMANDS is not 1 in ESP config.h.'
 }
+if ($EnableControl -and $relayUrl -like 'http://*') {
+    throw 'Remote vehicle commands over plain HTTP are refused. Use verified HTTPS or start read-only telemetry.'
+}
 
 # One EV gateway owns HTTP 8766, command UDP 9005, and pit-forward UDP 9004.
 Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |

@@ -80,6 +80,46 @@ https://<stable-ngrok-domain>/api/vehicle/exchange
 
 The Baja server does not need to run for the EV pit dashboard.
 
+### Free-plan operating budget
+
+As of 2026-09-09, the ngrok free plan allows 20,000 HTTP(S) requests and
+1 GB of outbound transfer per month on its assigned development domain. Check
+the [official free-plan limits](https://ngrok.com/docs/pricing-limits/free-plan-limits)
+before an event because these limits can change.
+
+The current ESP relay performs one HTTP request per telemetry update. At 2 Hz,
+20,000 requests last about 2.8 hours; at 1 Hz they last about 5.6 hours. This
+transport is therefore suitable for explicitly started test sessions, not an
+always-on free-plan installation. A future continuous high-rate link should use
+a persistent WebSocket or another persistent transport; ngrok HTTP endpoints
+[support WebSockets](https://ngrok.com/docs/using-ngrok-with/websockets).
+
+### HTTP-only diagnostic fallback
+
+Some carrier or site networks can reach ngrok on port 80 but terminate the
+ESP32 TLS connection on port 443. Confirm that condition first; a normal setup
+must keep HTTPS. For temporary, uplink-only telemetry, create an explicit HTTP
+endpoint instead of accepting ngrok's default HTTPS endpoint:
+
+```powershell
+.\scripts\start_ev_ngrok.ps1 -ReplaceExisting `
+    -PublicUrl 'http://<stable-ngrok-domain>'
+```
+
+The ignored ESP `config.h` must then use the same `http://` URL and explicitly
+opt in:
+
+```c
+#define EV_RELAY_URL "http://<stable-ngrok-domain>/api/vehicle/exchange"
+#define EV_ALLOW_PLAINTEXT_RELAY 1
+#define EV_RELAY_ACCEPT_COMMANDS 0
+```
+
+HTTP exposes telemetry and the bearer token to the network path. It is only a
+temporary diagnostic fallback, never a vehicle-control transport. The pit
+launcher refuses `-EnableControl` when the configured relay URL is HTTP. Rotate
+the relay token after using this mode, then return to verified HTTPS.
+
 ## ESP private configuration
 
 Copy `firmware/esp32_ev_gateway/include/config.example.h` to the ignored
@@ -107,9 +147,10 @@ For bidirectional vehicle use, install the endpoint root CA as
 #define EV_RELAY_ACCEPT_COMMANDS 1
 ```
 
-The firmware intentionally refuses to compile if remote commands and insecure
-TLS are enabled together. A stable ngrok domain is required because changing the
-public URL requires rebuilding the ESP configuration.
+The firmware intentionally refuses to compile if remote commands are combined
+with insecure TLS or the plaintext-relay opt-in. A stable ngrok domain is
+required because changing the public URL requires rebuilding the ESP
+configuration.
 
 ## Link meanings
 

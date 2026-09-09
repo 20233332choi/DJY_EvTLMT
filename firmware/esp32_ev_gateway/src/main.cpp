@@ -72,6 +72,10 @@
 #error "Internet vehicle commands require verified TLS; do not combine command RX with insecure TLS"
 #endif
 
+#if EV_RELAY_ENABLED && EV_RELAY_ACCEPT_COMMANDS && EV_ALLOW_PLAINTEXT_RELAY && !EV_ALLOW_INSECURE_RELAY_COMMANDS
+#error "Internet vehicle commands require verified TLS; do not combine command RX with plaintext HTTP"
+#endif
+
 namespace {
 
 WiFiUDP telemetryUdp;
@@ -233,14 +237,17 @@ void relayTask(void*) {
             vTaskDelete(nullptr);
             return;
 #endif
-            secureClient.setHandshakeTimeout(15);
+            // Keep failed cellular/ngrok handshakes bounded.  The relay task
+            // runs at idle priority below so a slow TLS peer cannot starve
+            // the ESP-IDF idle task and trip the core watchdog.
+            secureClient.setHandshakeTimeout(7);
         }
 
         HTTPClient http;
         http.useHTTP10(true);
         http.setReuse(false);
-        http.setConnectTimeout(15000);
-        http.setTimeout(15000);
+        http.setConnectTimeout(7000);
+        http.setTimeout(7000);
         bool success = false;
         if (http.begin(*relayClient, relayUrl)) {
             http.addHeader("Content-Type", "application/json");
@@ -742,7 +749,7 @@ void setup() {
     commandUdp.begin(EV_COMMAND_PORT);
     setStatusLed(0, 0, 64);
 #if EV_RELAY_ENABLED
-    xTaskCreatePinnedToCore(relayTask, "ev-https-relay", 12288, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(relayTask, "ev-https-relay", 12288, nullptr, 0, nullptr, 0);
 #endif
     Serial.println("# DJY ESP gateway ready");
 }

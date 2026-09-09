@@ -22,6 +22,8 @@
 #define EV_RELAY_ALLOW_INSECURE_TLS 0
 #define EV_RELAY_ACCEPT_COMMANDS 0
 #define EV_ALLOW_INSECURE_RELAY_COMMANDS 0
+// Plain HTTP is an unencrypted, read-only diagnostic fallback. Never enable
+// EV_RELAY_ACCEPT_COMMANDS with this option.
 #define EV_ALLOW_PLAINTEXT_RELAY 0
 // For verified TLS, define EV_RELAY_CA_CERT as the PEM root CA string used by
 // the HTTPS endpoint, then enable command reception only after validation.
