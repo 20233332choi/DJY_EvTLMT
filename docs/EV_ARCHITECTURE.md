@@ -138,8 +138,7 @@ UDP `9004`에도 합쳐지지 않는다. `모든 테스트 해제`를 누르면 
 실제 ESP32 연결 시:
 
 ```powershell
-python .\gateway\ev_gateway.py
-.\run_dashboard.bat ev
+.\run_dashboard.bat local
 ```
 
 ESP32는 피트 노트북의 UDP 9003으로 EV JSON을 전송한다. 게이트웨이가 CMake 전용

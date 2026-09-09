@@ -41,12 +41,12 @@ python .\gateway\ev_gateway.py
 .\run_dashboard.bat ev
 ```
 
-After the private ESP `config.h` contains the matching URL and token, the
-one-click launchers are:
+After the private ESP `config.h` contains the matching URL and token, use the
+single launcher:
 
 ```powershell
-.\run_internet_pit_dashboard.bat  # read-only telemetry
-.\run_internet_pit_control.bat    # bidirectional TQV control
+.\run_dashboard.bat internet          # read-only telemetry
+.\run_dashboard.bat internet-control  # bidirectional TQV control
 ```
 
 The launcher stops duplicate EV gateway processes, binds the EV server to

@@ -15,6 +15,10 @@ Windows C++ 피트 대시보드입니다. GUI는 CMake, Dear ImGui, Win32, Direc
 run_dashboard.bat
 ```
 
+BAT 파일은 이 하나만 사용합니다. 더블클릭하면 인터넷 읽기 전용, 로컬 Gateway,
+BMS USB 벤치, ESP 직접 수신, 재빌드 및 인터넷 제어 모드를 고르는 통합 메뉴가 열립니다.
+평상시에는 `1. 인터넷 피트 텔레메트리 (읽기 전용)`을 선택합니다.
+
 대시보드는 기본적으로 Gateway의 실차 JSON을 UDP `9004`에서 기다립니다. 패킷이 없으면
 임의값을 만들지 않고 각 항목에 `--` 또는 `수신 대기`를 표시합니다.
 
@@ -35,7 +39,7 @@ Gateway 없이 ESP32의 로컬 UDP `9003`을 직접 받을 때만 다음 모드�
 현재 DALY R24TS를 USB-UART로 PC에 직접 연결하여 확인할 때는 다음 파일을 실행합니다.
 
 ```powershell
-.\run_bms_pit_dashboard.bat
+.\run_dashboard.bat bms COM5
 ```
 
 Gateway가 BMS 데이터와 차량 텔레메트리를 병합해 UDP `9004`로 전달합니다. BMS 드라이버는
