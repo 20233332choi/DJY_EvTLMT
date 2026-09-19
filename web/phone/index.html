@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>DJY EV 휴대폰 GNSS</title>
+  <style>
+    :root { color-scheme: dark; --bg:#071019; --panel:#0d1a25; --line:#263a49; --cyan:#27c5df; --green:#35d67b; --red:#ff5964; --muted:#8fa1ae; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:#eef5f8; font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif; }
+    main { max-width:620px; margin:auto; padding:24px 18px 40px; }
+    h1 { margin:0 0 8px; font-size:25px; }
+    .sub { color:var(--muted); line-height:1.55; font-size:14px; }
+    button { width:100%; min-height:58px; margin:18px 0; border:1px solid var(--cyan); border-radius:8px; background:#09212c; color:var(--cyan); font-size:18px; font-weight:800; }
+    button.active { border-color:var(--red); color:var(--red); background:#281116; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .card { padding:14px; border:1px solid var(--line); border-radius:8px; background:var(--panel); }
+    .label { color:var(--muted); font-size:12px; }
+    .value { margin-top:5px; color:var(--green); font:700 19px ui-monospace,Consolas,monospace; overflow:hidden; }
+    pre { min-height:120px; padding:14px; border:1px solid var(--line); border-radius:8px; background:#050b10; color:var(--muted); white-space:pre-wrap; font:13px/1.55 ui-monospace,Consolas,monospace; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>DJY EV 휴대폰 GNSS</h1>
+    <p class="sub">휴대폰을 차량에 단단히 고정한 뒤 시작하세요. 위치 권한 사용을 위해 ngrok의 HTTPS 주소로 이 페이지를 열어야 합니다.</p>
+    <button id="toggle">GPS 전송 시작</button>
+    <section class="grid">
+      <div class="card"><div class="label">속도</div><div class="value" id="speed">--.- km/h</div></div>
+      <div class="card"><div class="label">정확도</div><div class="value" id="accuracy">--.- m</div></div>
+      <div class="card"><div class="label">위도</div><div class="value" id="lat">--</div></div>
+      <div class="card"><div class="label">경도</div><div class="value" id="lon">--</div></div>
+      <div class="card"><div class="label">진행 방향</div><div class="value" id="heading">--.-°</div></div>
+      <div class="card"><div class="label">서버 상태</div><div class="value" id="server">대기</div></div>
+    </section>
+    <pre id="status">GPS 전송 대기 중</pre>
+  </main>
+  <script>
+    const button = document.getElementById('toggle');
+    const statusEl = document.getElementById('status');
+    let watchId = null;
+    let sending = false;
+    let accepted = 0;
+    let failed = 0;
+    let lastSentAt = 0;
+
+    const show = (id, value) => { document.getElementById(id).textContent = value; };
+
+    function stop() {
+      if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+      sending = false;
+      button.textContent = 'GPS 전송 시작';
+      button.classList.remove('active');
+      statusEl.textContent = `전송 중지됨\n성공 ${accepted} / 실패 ${failed}`;
+    }
+
+    async function sendPosition(position) {
+      const c = position.coords;
+      const payload = {
+        ts: position.timestamp / 1000,
+        lat: c.latitude,
+        lon: c.longitude,
+        accuracy_m: c.accuracy,
+        speed_kmh: c.speed == null ? null : c.speed * 3.6,
+        heading: c.heading,
+        altitude: c.altitude
+      };
+      show('speed', payload.speed_kmh == null ? '--.- km/h' : `${payload.speed_kmh.toFixed(1)} km/h`);
+      show('accuracy', `${payload.accuracy_m.toFixed(1)} m`);
+      show('lat', payload.lat.toFixed(7));
+      show('lon', payload.lon.toFixed(7));
+      show('heading', payload.heading == null ? '--.-°' : `${payload.heading.toFixed(1)}°`);
+      const now = performance.now();
+      if (now - lastSentAt < 800) return;
+      lastSentAt = now;
+      try {
+        const response = await fetch('/api/gnss', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(payload),
+          keepalive: true
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        accepted++;
+        show('server', '수신 중');
+        statusEl.textContent = `GNSS 전송 중\n정확도 ${payload.accuracy_m.toFixed(1)} m\n성공 ${accepted} / 실패 ${failed}`;
+      } catch (error) {
+        failed++;
+        show('server', '전송 오류');
+        statusEl.textContent = `서버 전송 실패\n${error}\n성공 ${accepted} / 실패 ${failed}`;
+      }
+    }
+
+    button.onclick = () => {
+      if (sending) { stop(); return; }
+      if (!window.isSecureContext) {
+        statusEl.textContent = 'GPS 권한을 사용할 수 없는 HTTP 연결입니다. ngrok HTTPS 주소로 접속하세요.';
+        return;
+      }
+      if (!navigator.geolocation) {
+        statusEl.textContent = '이 휴대폰/브라우저는 위치 정보를 지원하지 않습니다.';
+        return;
+      }
+      sending = true;
+      button.textContent = 'GPS 전송 중지';
+      button.classList.add('active');
+      statusEl.textContent = '고정밀 GPS 위치를 기다리는 중';
+      watchId = navigator.geolocation.watchPosition(
+        sendPosition,
+        error => {
+          failed++;
+          show('server', 'GPS 오류');
+          statusEl.textContent = `GPS 오류 ${error.code}\n${error.message}`;
+        },
+        {enableHighAccuracy:true, maximumAge:0, timeout:15000}
+      );
+    };
+  </script>
+</body>
+</html>

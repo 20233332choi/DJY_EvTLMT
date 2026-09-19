@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760">
+  <defs>
+    <style>
+      .title { font: 700 30px "Malgun Gothic", "Segoe UI", sans-serif; fill: #f4f7fb; }
+      .subtitle { font: 16px "Malgun Gothic", "Segoe UI", sans-serif; fill: #9fb0c4; }
+      .panel-title { font: 700 24px "Malgun Gothic", "Segoe UI", sans-serif; fill: #f4f7fb; }
+      .pin { font: 700 18px Consolas, monospace; fill: #f4f7fb; }
+      .desc { font: 15px "Malgun Gothic", "Segoe UI", sans-serif; fill: #b9c6d6; }
+      .wire-label { font: 700 16px "Malgun Gothic", "Segoe UI", sans-serif; }
+      .note { font: 15px "Malgun Gothic", "Segoe UI", sans-serif; fill: #d6deea; }
+      .small { font: 13px "Malgun Gothic", "Segoe UI", sans-serif; fill: #9fb0c4; }
+    </style>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#39bff8"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#ffad42"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="760" fill="#0b1118"/>
+  <text x="600" y="48" text-anchor="middle" class="title">Rear STM32 ↔ ESP32-S3 UART Wiring</text>
+  <text x="600" y="78" text-anchor="middle" class="subtitle">CONFIRMED · EV_REAR_UART_MODE=1 · 3.3 V TTL · 115200 8N1</text>
+
+  <rect x="50" y="115" width="390" height="410" rx="18" fill="#121c27" stroke="#60758d" stroke-width="2"/>
+  <text x="245" y="157" text-anchor="middle" class="panel-title">Rear STM32F446RE</text>
+  <text x="245" y="184" text-anchor="middle" class="subtitle">USART1 · dedicated ESP link</text>
+
+  <rect x="82" y="214" width="325" height="72" rx="10" fill="#192838"/>
+  <text x="104" y="243" class="pin">PA9 / D8</text>
+  <text x="104" y="268" class="desc">USART1_TX · telemetry out</text>
+
+  <rect x="82" y="315" width="325" height="72" rx="10" fill="#192838"/>
+  <text x="104" y="344" class="pin">PA10 / D2</text>
+  <text x="104" y="369" class="desc">USART1_RX · command in</text>
+
+  <rect x="82" y="416" width="325" height="72" rx="10" fill="#192838"/>
+  <text x="104" y="445" class="pin">GND</text>
+  <text x="104" y="470" class="desc">signal reference</text>
+
+  <rect x="760" y="115" width="390" height="410" rx="18" fill="#121c27" stroke="#60758d" stroke-width="2"/>
+  <text x="955" y="157" text-anchor="middle" class="panel-title">ESP32-S3 DevKitC-1</text>
+  <text x="955" y="184" text-anchor="middle" class="subtitle">UART1 · Wi-Fi gateway</text>
+
+  <rect x="793" y="214" width="325" height="72" rx="10" fill="#192838"/>
+  <text x="815" y="243" class="pin">GPIO18</text>
+  <text x="815" y="268" class="desc">UART1_RX · telemetry in</text>
+
+  <rect x="793" y="315" width="325" height="72" rx="10" fill="#192838"/>
+  <text x="815" y="344" class="pin">GPIO17</text>
+  <text x="815" y="369" class="desc">UART1_TX · command out</text>
+
+  <rect x="793" y="416" width="325" height="72" rx="10" fill="#192838"/>
+  <text x="815" y="445" class="pin">GND</text>
+  <text x="815" y="470" class="desc">signal reference</text>
+
+  <line x1="407" y1="250" x2="793" y2="250" stroke="#39bff8" stroke-width="5" marker-end="url(#arrowBlue)"/>
+  <text x="600" y="232" text-anchor="middle" class="wire-label" fill="#39bff8">PA9 TX → GPIO18 RX</text>
+
+  <line x1="793" y1="351" x2="407" y2="351" stroke="#ffad42" stroke-width="5" marker-end="url(#arrowOrange)"/>
+  <text x="600" y="333" text-anchor="middle" class="wire-label" fill="#ffad42">GPIO17 TX → PA10 RX</text>
+
+  <line x1="407" y1="452" x2="793" y2="452" stroke="#d6deea" stroke-width="5"/>
+  <circle cx="407" cy="452" r="6" fill="#d6deea"/>
+  <circle cx="793" cy="452" r="6" fill="#d6deea"/>
+  <text x="600" y="434" text-anchor="middle" class="wire-label" fill="#d6deea">GND ↔ GND</text>
+
+  <rect x="50" y="558" width="1100" height="145" rx="16" fill="#21191a" stroke="#ff6961" stroke-width="2"/>
+  <text x="75" y="592" class="panel-title" fill="#ff817a">WIRING LIMITS</text>
+  <text x="75" y="624" class="note">• GPIO17/18 are 3.3 V TTL UART in the current build — not RS232, RS485 A/B, CANH or CANL.</text>
+  <text x="75" y="652" class="note">• If both boards use their own USB power, connect only TX, RX and GND. Do not tie 5 V or 3V3 rails together.</text>
+  <text x="75" y="680" class="note">• Keep raw UART inside the same enclosure/short harness. Use a differential physical layer for a long vehicle cable.</text>
+
+  <text x="600" y="735" text-anchor="middle" class="small">Optional: 100–330 Ω series resistor close to each TX pin · Verify board labels before applying power</text>
+</svg>
+

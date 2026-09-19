@@ -47,6 +47,9 @@ DALY R24TS BMS
 | ESP32 → DISP | Wi-Fi → gateway → UDP 9004 | 기존 로컬/인터넷 경로 사용 |
 | BMS → PC | UART-to-USB | 현재 벤치 검증용, 최종 차량 경로 아님 |
 
+STM32R과 ESP32-S3의 현재 핀별 연결은
+[ESP32-S3 ↔ Rear STM32 배선](ESP32_STM32_WIRING.md)을 기준으로 한다.
+
 ### ESP32 자원 배정과 충돌 판정
 
 ESP32-S3에는 UART 컨트롤러가 세 개 있으므로 다음처럼 분리하면 주변장치 충돌은 없다.

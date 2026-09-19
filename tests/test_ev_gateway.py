@@ -1,7 +1,10 @@
 import io
+import http.client
 import json
 import math
+import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -15,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gateway"))
 from ev_gateway import (  # noqa: E402
     DisplayTestState,
     EVGateway,
+    TelemetryDatabase,
     TelemetryStore,
     is_local_http_request,
     make_handler,
@@ -25,6 +29,84 @@ from ev_gateway import (  # noqa: E402
 
 
 class EVGatewayTests(unittest.TestCase):
+    def test_database_records_complete_session_payload_and_tqv_columns(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telemetry.db"
+            database = TelemetryDatabase(path)
+            try:
+                status = database.start("bench")
+                self.assertTrue(status["recording_active"])
+                database.record({
+                    "seq": 7,
+                    "vehicle_speed_m_s": 12.3,
+                    "desired_yaw_rad_s": 0.4,
+                    "yaw_error_rad_s": -0.1,
+                    "delta_power_kw": 2.2,
+                    "power_left_kw": 8.1,
+                    "power_right_kw": 10.3,
+                    "tv_active": True,
+                    "ed_active": False,
+                    "traction_scale": 0.75,
+                    "custom_future_field": "preserved",
+                })
+                stopped = database.stop()
+                self.assertFalse(stopped["recording_active"])
+                sessions = database.list_sessions()
+                samples = database.list_samples(sessions[0]["id"])
+                self.assertEqual(sessions[0]["sample_count"], 1)
+                self.assertEqual(samples["total"], 1)
+                self.assertEqual(
+                    samples["samples"][0]["telemetry"]["custom_future_field"],
+                    "preserved",
+                )
+            finally:
+                database.close()
+            connection = sqlite3.connect(path)
+            try:
+                row = connection.execute(
+                    "SELECT vehicle_speed_m_s,desired_yaw_rad_s,yaw_error_rad_s,"
+                    "delta_power_kw,power_left_kw,power_right_kw,tv_active,ed_active,"
+                    "traction_scale,payload_json FROM telemetry_samples"
+                ).fetchone()
+                session = connection.execute(
+                    "SELECT sample_count,stopped_at_utc FROM measurement_sessions"
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertIsNotNone(row)
+            assert row is not None and session is not None
+            self.assertEqual(row[:9], (12.3, 0.4, -0.1, 2.2, 8.1, 10.3, 1, 0, 0.75))
+            self.assertEqual(json.loads(row[9])["custom_future_field"], "preserved")
+            self.assertEqual(session[0], 1)
+            self.assertIsNotNone(session[1])
+
+    def test_gateway_recording_preserves_unrecognized_input_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            gateway = EVGateway(
+                "127.0.0.1", 9003, "127.0.0.1", 9004,
+                database_path=Path(temp_dir) / "telemetry.db",
+            )
+            try:
+                gateway.set_recording(True, "future-field")
+                gateway.accept({
+                    "seq": 2,
+                    "stm_online": True,
+                    "vehicle_speed_m_s": 1.25,
+                    "future_controller_value": {"raw": 77},
+                })
+                gateway.set_recording(False)
+                session_id = gateway.database.list_sessions()[0]["id"]
+                samples = gateway.database.list_samples(session_id, 100)["samples"]
+                preserved = [
+                    sample["telemetry"].get("future_controller_value")
+                    for sample in samples
+                    if "future_controller_value" in sample["telemetry"]
+                ]
+                self.assertEqual(preserved, [{"raw": 77}, {"raw": 77}])
+            finally:
+                gateway.database.close()
+                gateway.forward_socket.close()
+
     def test_parses_front_direct_sensor_status(self):
         packet = parse_front_status(
             b"FRONT sas_raw=8192 sas_abs=180.00 sas_ok=1 "
@@ -96,6 +178,35 @@ class EVGatewayTests(unittest.TestCase):
         self.assertAlmostEqual(packet["gnss_longitude_deg"], 127.1234567)
         self.assertEqual(packet["gnss_heading_deg"], 1.5)
 
+    def test_phone_gnss_is_merged_into_pit_snapshot(self):
+        gateway = EVGateway("127.0.0.1", 9003, "127.0.0.1", 9004)
+        try:
+            result = gateway.update_phone_gnss({
+                "lat": 37.1234567,
+                "lon": 127.7654321,
+                "accuracy_m": 4.2,
+                "speed_kmh": 32.5,
+                "heading": 91.0,
+                "altitude": 55.0,
+            })
+            snapshot = gateway.snapshot()
+            self.assertTrue(result["accepted"])
+            self.assertTrue(snapshot["gnss_online"])
+            self.assertEqual(snapshot["gnss_source"], "PHONE GPS")
+            self.assertAlmostEqual(snapshot["gnss_latitude_deg"], 37.1234567)
+            self.assertAlmostEqual(snapshot["gnss_longitude_deg"], 127.7654321)
+            self.assertAlmostEqual(snapshot["gnss_accuracy_m"], 4.2)
+        finally:
+            gateway.forward_socket.close()
+
+    def test_phone_gnss_rejects_invalid_accuracy(self):
+        gateway = EVGateway("127.0.0.1", 9003, "127.0.0.1", 9004)
+        try:
+            with self.assertRaises(ValueError):
+                gateway.update_phone_gnss({"lat": 37.0, "lon": 127.0, "accuracy_m": 150.0})
+        finally:
+            gateway.forward_socket.close()
+
     def test_aliases_and_limits(self):
         packet = normalize_packet(
             {
@@ -144,6 +255,28 @@ class EVGatewayTests(unittest.TestCase):
         self.assertEqual(live["lost_packets"], 2)
         self.assertTrue(live["online"])
         self.assertFalse(stale["online"])
+
+    def test_explicit_offline_stm_does_not_mark_vehicle_or_tqv_online(self):
+        store = TelemetryStore()
+        store.update({
+            "seq": 1,
+            "stm_online": False,
+            "rear_output_online": False,
+            "tqv_internal_online": False,
+            "vehicle_speed_m_s": 0.0,
+            "desired_yaw_rad_s": 0.0,
+            "yaw_error_rad_s": 0.0,
+            "delta_power_kw": 0.0,
+            "power_left_kw": 0.0,
+            "power_right_kw": 0.0,
+            "tv_active": False,
+            "ed_active": False,
+            "traction_scale": 1.0,
+        }, now=1.0)
+        snapshot = store.snapshot(now=1.1)
+        self.assertFalse(snapshot["vehicle_online"])
+        self.assertFalse(snapshot["rear_output_online"])
+        self.assertFalse(snapshot["tqv_internal_online"])
 
     def test_store_merges_partial_packets_and_tracks_each_signal_age(self):
         store = TelemetryStore()
@@ -455,7 +588,37 @@ class EVGatewayTests(unittest.TestCase):
             server.server_close()
             gateway.forward_socket.close()
 
-    def test_http_pit_dashboard_was_removed_in_favor_of_cmake(self):
+    def test_authenticated_exchange_reuses_socket_but_rejection_closes(self):
+        gateway = EVGateway("127.0.0.1", 9003, "127.0.0.1", 9004, relay_token="relay-secret-1234")
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(gateway))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        headers = {"Authorization": "Bearer relay-secret-1234", "Content-Type": "application/json"}
+        try:
+            previous_socket = None
+            for seq in (31, 32):
+                client.request("POST", "/api/vehicle/exchange", json.dumps({"seq": seq}), headers)
+                response = client.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertFalse(response.will_close)
+                self.assertTrue(json.loads(response.read())["ok"])
+                if previous_socket is not None:
+                    self.assertIs(client.sock, previous_socket)
+                previous_socket = client.sock
+            self.assertEqual(gateway.snapshot()["seq"], 32)
+            client.request("POST", "/api/vehicle/exchange")
+            response = client.getresponse()
+            self.assertEqual(response.status, 401)
+            self.assertTrue(response.will_close)
+            response.read()
+        finally:
+            client.close()
+            server.shutdown()
+            server.server_close()
+            gateway.forward_socket.close()
+
+    def test_http_pit_dashboard_is_html(self):
         gateway = EVGateway("127.0.0.1", 9003, "127.0.0.1", 9004)
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(gateway))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -464,15 +627,87 @@ class EVGatewayTests(unittest.TestCase):
         try:
             with urllib.request.urlopen(f"{base}/driver", timeout=2) as response:
                 self.assertEqual(response.status, 200)
-            with self.assertRaises(urllib.error.HTTPError) as missing:
-                urllib.request.urlopen(f"{base}/pit", timeout=2)
-            self.assertEqual(missing.exception.code, 404)
-            missing.exception.read()
-            missing.exception.close()
+            with urllib.request.urlopen(f"{base}/pit", timeout=2) as response:
+                pit = response.read().decode("utf-8")
+                self.assertIn("EV 피트 대시보드", pit)
+                self.assertIn('href="/battery"', pit)
+            with urllib.request.urlopen(f"{base}/battery", timeout=2) as response:
+                battery = response.read().decode("utf-8")
+                self.assertEqual(response.status, 200)
+                self.assertIn("DALY BMS 상태", battery)
+                self.assertIn("/api/telemetry", battery)
         finally:
             server.shutdown()
             server.server_close()
             gateway.forward_socket.close()
+
+    def test_http_phone_page_posts_gnss_to_snapshot(self):
+        gateway = EVGateway("127.0.0.1", 9003, "127.0.0.1", 9004)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(gateway))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            with urllib.request.urlopen(f"{base}/phone", timeout=2) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("GPS 전송 시작", response.read().decode("utf-8"))
+            body = json.dumps({
+                "lat": 37.1, "lon": 127.1, "accuracy_m": 3.5,
+                "speed_kmh": 12.0, "heading": 45.0,
+            }).encode("utf-8")
+            request = urllib.request.Request(
+                f"{base}/api/gnss", data=body, method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            self.assertTrue(result["ok"])
+            self.assertTrue(gateway.snapshot()["gnss_online"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            gateway.forward_socket.close()
+
+    def test_http_record_viewer_is_local_only_and_reads_database(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            gateway = EVGateway(
+                "127.0.0.1", 9003, "127.0.0.1", 9004,
+                database_path=Path(temp_dir) / "telemetry.db",
+            )
+            gateway.set_recording(True, "viewer-test")
+            gateway.store.update({"seq": 12, "vehicle_speed_m_s": 3.2, "tv_active": True})
+            gateway._forward_snapshot()
+            gateway.set_recording(False)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(gateway))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with urllib.request.urlopen(f"{base}/records", timeout=2) as response:
+                    self.assertIn("DJY EV 측정 기록", response.read().decode("utf-8"))
+                with urllib.request.urlopen(f"{base}/api/recording/sessions", timeout=2) as response:
+                    sessions = json.loads(response.read().decode("utf-8"))["sessions"]
+                self.assertEqual(sessions[0]["label"], "viewer-test")
+                with urllib.request.urlopen(
+                    f"{base}/api/recording/samples?session_id={sessions[0]['id']}", timeout=2
+                ) as response:
+                    samples = json.loads(response.read().decode("utf-8"))
+                self.assertGreaterEqual(samples["total"], 2)
+                self.assertEqual(samples["samples"][-1]["telemetry"]["seq"], 12)
+
+                forwarded = urllib.request.Request(
+                    f"{base}/records", headers={"X-Forwarded-For": "203.0.113.9"}
+                )
+                with self.assertRaises(urllib.error.HTTPError) as denied:
+                    urllib.request.urlopen(forwarded, timeout=2)
+                self.assertEqual(denied.exception.code, 403)
+                denied.exception.read()
+                denied.exception.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                gateway.database.close()
+                gateway.forward_socket.close()
 
 
 if __name__ == "__main__":

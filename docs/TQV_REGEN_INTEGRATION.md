@@ -12,7 +12,9 @@ Front STM ── 0x100/0x110 ── CAN 500 kbit/s ──> Rear STM
    │                                               ├─ 0x310 적용 상태
    │                                               ├─ 0x311 RPM/DAC
    │                                               └─ 0x320 피트 설정 ACK
-   └──────────────────── 같은 차량 CAN ───────────────> ESP32-S3
+                                                   UART │ 115200 8N1
+                                                        v
+                                                    ESP32-S3
                                                         │
                               Wi-Fi UDP 9003 / USB JSON │
                                                         v
@@ -21,8 +23,9 @@ Front STM ── 0x100/0x110 ── CAN 500 kbit/s ──> Rear STM
 ```
 
 모터 컨트롤러의 CAN은 프로토콜과 비트레이트가 확인되기 전까지 이 차량 CAN과 직접
-합치지 않는다. ESP32와 STM32에는 각각 3.3 V CAN 트랜시버가 필요하며 CANH/CANL,
-GND를 공통으로 연결한다. 버스 양 끝에만 120 Ω 종단저항을 둔다.
+합치지 않는다. Front/Rear STM32에는 각각 3.3 V CAN 트랜시버가 필요하며 CANH/CANL,
+GND를 공통으로 연결한다. 버스 양 끝에만 120 Ω 종단저항을 둔다. 현재 ESP32는 차량
+CAN에 직접 붙지 않고 Rear STM32의 USART1에 연결한다.
 
 ## 화면에서 구분하는 값
 
@@ -53,14 +56,15 @@ GND를 공통으로 연결한다. 버스 양 끝에만 120 Ω 종단저항을 �
 
 ## ESP32-S3 배선과 설정
 
-기본 핀은 다음과 같으며 `firmware/esp32_ev_gateway/include/config.h`에서 변경할 수 있다.
+현재 PlatformIO 빌드는 `EV_REAR_UART_MODE=1`이다. 핀별 그림과 전원 주의사항은
+[ESP32-S3 ↔ Rear STM32 배선](ESP32_STM32_WIRING.md)을 기준으로 한다.
 
-| ESP32-S3 | 연결 |
-|---|---|
-| GPIO17 | CAN 트랜시버 TXD |
-| GPIO18 | CAN 트랜시버 RXD |
-| GPIO4 | PIT ENABLE 스위치, 스위치 반대쪽은 GND |
-| 3V3/GND | 3.3 V CAN 트랜시버 전원/GND |
+| Rear STM32 | ESP32-S3 | 연결 |
+|---|---|---|
+| PA9 / USART1_TX | GPIO18 / UART1_RX | Rear 텔레메트리 |
+| PA10 / USART1_RX | GPIO17 / UART1_TX | ESP 피트 명령 |
+| GND | GND | 공통 신호 기준 |
+| - | GPIO4 | PIT ENABLE 스위치, 스위치 반대쪽은 GND |
 
 `config.example.h`를 `config.h`로 복사하고 핫스팟 SSID, 비밀번호, 피트 노트북 IP를
 입력한다. 비밀번호가 든 `config.h`는 Git에서 제외된다.
@@ -71,11 +75,10 @@ pio run
 pio run -t upload --upload-port COM8
 ```
 
-ESP 펌웨어는 0x100, 0x110, 0x310, 0x311, 0x320을 읽어 50 Hz JSON으로 전송한다.
-Wi-Fi 절전은 꺼서 지연을 줄였고 같은 JSON을 USB CDC 115200에도 출력한다.
-또한 `0x121 ESP_STATUS`를 100 ms마다 보내므로 Front/Rear STM32에서 ESP CAN 연결,
-Wi-Fi 및 PIT ENABLE 상태와 sequence를 확인할 수 있다. 이 프레임은 연결 진단 전용이며
-구동 명령에는 사용하지 않는다.
+Rear STM32가 차량 CAN에서 모은 값과 자체 출력 상태를 USART1로 보내면 ESP 펌웨어가
+이를 JSON으로 변환한다. Wi-Fi 절전은 꺼서 지연을 줄였고 같은 JSON을 USB serial
+115200에도 출력한다. ESP의 TWAI/CAN 코드와 `0x121 ESP_STATUS`는 대체 CAN 모드에
+남아 있지만 현재 UART 빌드에서는 사용하지 않는다.
 
 ## 실차 프로그램 실행
 

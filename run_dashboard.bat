@@ -7,8 +7,10 @@ set "EXE=%ROOT%bin\DJY_EvTLMT.exe"
 if /I "%~1"=="internet" goto INTERNET
 if /I "%~1"=="internet-control" goto INTERNET_CONTROL
 if /I "%~1"=="local" goto LOCAL
+if /I "%~1"=="wired" goto WIRED
 if /I "%~1"=="bms" goto BMS
 if /I "%~1"=="ev" goto EV_DASHBOARD
+if /I "%~1"=="native" goto NATIVE_DASHBOARD
 if /I "%~1"=="ev-direct" goto DIRECT_DASHBOARD
 if /I "%~1"=="rebuild" goto REBUILD
 if /I "%~1"=="help" goto USAGE
@@ -19,22 +21,24 @@ cls
 echo ==================================================
 echo              DJY EV Unified Launcher
 echo ==================================================
-echo [1] Internet pit telemetry ^(read only, recommended^)
-echo [2] Local ESP/Gateway telemetry
+echo [1] STM Rear USB direct telemetry ^(read only, recommended^)
+echo [2] HTML local ESP/Gateway telemetry
 echo [3] BMS USB bench
 echo [4] Direct ESP UDP 9003 input
 echo [5] Rebuild C dashboard
 echo [6] Internet pit control ^(verified HTTPS only^)
+echo [7] HTML internet pit telemetry ^(ngrok^)
 echo [0] Exit
 echo.
 set "SELECT="
 set /p "SELECT=Select: "
-if "%SELECT%"=="1" goto INTERNET
+if "%SELECT%"=="1" goto WIRED
 if "%SELECT%"=="2" goto LOCAL
 if "%SELECT%"=="3" goto BMS_MENU
 if "%SELECT%"=="4" goto DIRECT_DASHBOARD
 if "%SELECT%"=="5" goto REBUILD
 if "%SELECT%"=="6" goto INTERNET_CONTROL
+if "%SELECT%"=="7" goto INTERNET
 if "%SELECT%"=="0" exit /b 0
 echo Invalid selection.
 pause
@@ -66,6 +70,14 @@ set "RUN_RC=%errorlevel%"
 if not "%RUN_RC%"=="0" pause
 exit /b %RUN_RC%
 
+:WIRED
+set "REAR_PORT=%~2"
+if "%REAR_PORT%"=="" set "REAR_PORT=auto"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\run_ev_stack.ps1" -Wired -RearPort "%REAR_PORT%"
+set "RUN_RC=%errorlevel%"
+if not "%RUN_RC%"=="0" pause
+exit /b %RUN_RC%
+
 :BMS_MENU
 set "BMS_PORT=COM5"
 set /p "BMS_PORT=BMS port [COM5]: "
@@ -83,11 +95,15 @@ if not "%RUN_RC%"=="0" pause
 exit /b %RUN_RC%
 
 :EV_DASHBOARD
-set "MODE=--ev"
-goto START_DASHBOARD
+start "" "http://127.0.0.1:8766/pit"
+exit /b 0
 
 :DIRECT_DASHBOARD
 set "MODE=--ev-direct"
+goto START_DASHBOARD
+
+:NATIVE_DASHBOARD
+set "MODE=--ev"
 goto START_DASHBOARD
 
 :REBUILD
@@ -125,6 +141,9 @@ echo Usage:
 echo   run_dashboard.bat                  Open menu
 echo   run_dashboard.bat internet         Internet read-only telemetry
 echo   run_dashboard.bat local            Local Gateway
+echo   run_dashboard.bat wired [COM port]  Rear STM USB read-only telemetry
+echo   run_dashboard.bat ev               Open HTML pit dashboard
+echo   run_dashboard.bat native           Legacy C dashboard and controls
 echo   run_dashboard.bat bms [COM port]   BMS USB bench
 echo   run_dashboard.bat ev-direct        Direct UDP 9003 input
 echo   run_dashboard.bat rebuild          Rebuild C dashboard

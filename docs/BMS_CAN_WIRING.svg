@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="360" viewBox="0 0 1000 360">
+  <style>text{font-family:Arial,'Malgun Gothic',sans-serif;fill:#182334} .box{fill:#f3f6fa;stroke:#456;stroke-width:2} .wire{stroke:#167458;stroke-width:3;fill:none}</style>
+  <rect width="1000" height="360" fill="white"/>
+  <text x="30" y="35" font-size="22">BMS CAN → ESP32-S3 · 현재 소스 기준 / 실물 모듈 핀 미확인</text>
+  <rect class="box" x="30" y="65" width="220" height="190" rx="8"/>
+  <rect class="box" x="370" y="65" width="270" height="190" rx="8"/>
+  <rect class="box" x="760" y="65" width="210" height="190" rx="8"/>
+  <text x="50" y="95" font-size="19">ESP32-S3</text>
+  <text x="390" y="95" font-size="19">CAN 트랜시버 (모델 미확인)</text>
+  <text x="780" y="95" font-size="19">DALY BMS CAN</text>
+  <text x="50" y="137">GPIO9 · TX</text><text x="390" y="137">TXD / D</text>
+  <path class="wire" d="M170 132 H380"/>
+  <text x="50" y="182">GPIO8 · RX</text><text x="390" y="182">RXD / R</text>
+  <path class="wire" d="M170 177 H380"/>
+  <text x="50" y="227">GND</text><text x="390" y="227">로직 GND</text>
+  <path class="wire" d="M170 222 H380"/>
+  <text x="575" y="137">CANH</text><text x="875" y="137">CANH</text>
+  <path class="wire" d="M630 132 H865"/>
+  <text x="575" y="182">CANL</text><text x="875" y="182">CANL</text>
+  <path class="wire" d="M630 177 H865"/>
+  <text x="30" y="285">코드 확정: GPIO9 TX / GPIO8 RX / 250 kbit/s · CANH/L을 GPIO에 직접 연결하지 않음</text>
+  <text x="30" y="313">미확인: BMS 커넥터 번호·색상, 트랜시버 전원·VIO·EN/STB, 절연·버스 GND, 기존 종단저항</text>
+  <text x="30" y="340">전원 및 버스 GND 배선은 실제 모듈 사양 확인 후 결정. BMS B−를 ESP GND로 임의 연결하지 않음.</text>
+</svg>

@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="760" viewBox="0 0 1220 760">
+<style>text{font-family:'Malgun Gothic',Arial,sans-serif;fill:#182334;font-size:16px}.title{font-size:23px;font-weight:bold}.head{font-size:20px;font-weight:bold}.box{fill:#f3f6fa;stroke:#425a70;stroke-width:2}.ok{stroke:#167458;stroke-width:3;fill:none}.missing{stroke:#b62828;stroke-width:3;stroke-dasharray:9 6;fill:none}.red{fill:#b62828}.small{font-size:14px}</style>
+<rect width="1220" height="760" fill="white"/>
+<text class="title" x="30" y="38">TorqueVectoring 최신 원본 ↔ DJY_EvTLMT · 2026-09-17 소스 대조</text>
+<text x="30" y="66">실선: 소스 구현 / 빨간 점선: 추가 필요 · 현재 STM 설치 이미지와 실제 전기 신호는 미확인</text>
+<rect class="box" x="30" y="95" width="330" height="325" rx="10"/>
+<text class="head" x="50" y="125">Front STM32F446RE</text>
+<text x="50" y="158">TPS → PA0 (ADC)</text>
+<text x="50" y="188">SAS: PB3 SCK / PB4 MISO</text>
+<text x="50" y="214">         PB5 MOSI / PB6 CS</text>
+<text x="50" y="250">TV 스위치 → PC13 + GND</text>
+<text x="50" y="278">스위치는 Front에서 읽음</text>
+<text x="50" y="318">CAN: PA12 TX / PA11 RX</text>
+<text x="50" y="353">PC 진단: PA2 TX / PA3 RX</text>
+<text x="50" y="385">LED: PA5 / SWD: PA13·PA14</text>
+<rect class="box" x="440" y="95" width="340" height="470" rx="10"/>
+<text class="head" x="460" y="125">Rear STM32F446RE</text>
+<text x="460" y="158">IMU TX → PA1 / IMU RX ← PA0</text>
+<text x="460" y="188">RPM 좌 → PB4 / 우 → PB5</text>
+<text class="red" x="460" y="224">현재 DAC: PA4 좌 / PA5 우</text>
+<text class="small" x="460" y="250">DAC_USE_INTERNAL=1 (주석과 충돌)</text>
+<text x="460" y="283">외장 DAC: PC10 SCK / PC11 CS</text>
+<text x="460" y="309">                 PC12 MOSI (현재 미선택)</text>
+<text x="460" y="344">CAN: PA12 TX / PA11 RX</text>
+<text x="460" y="376">SD: PB13 SCK / PB14 MISO</text>
+<text x="460" y="402">       PB15 MOSI / PB1 CS</text>
+<text class="red" x="460" y="440">PA9 TX·PA10 RX USART1 추가</text>
+<text x="460" y="473">실제 로그: PA2 TX (USART2)</text>
+<text x="460" y="499">PA3 RX / 115200 8N1</text>
+<text x="460" y="532">TV 스위치: Front CAN 값 사용</text>
+<path class="ok" d="M360 330 H440"/>
+<text class="small" x="32" y="451">Front ↔ Rear: 각 CAN 트랜시버 경유</text>
+<text class="small" x="32" y="476">차량 CAN 500 kbit/s · CANH ↔ CANH</text>
+<text class="small" x="32" y="501">CANL ↔ CANL · MCU 핀 직결 아님</text>
+<rect class="box" x="885" y="95" width="305" height="270" rx="10"/>
+<text class="head" x="905" y="125">ESP32-S3</text>
+<text x="905" y="163">STM RX: GPIO18 ← PA9</text>
+<text x="905" y="191">STM TX: GPIO17 → PA10</text>
+<text x="905" y="219">GND 공통 · UART 115200 8N1</text>
+<text x="905" y="259">BMS CAN: GPIO9 TX / GPIO8 RX</text>
+<text x="905" y="288">LED: GPIO38 / PIT: GPIO4</text>
+<text x="905" y="327">Wi-Fi UDP 9003 → PC</text>
+<path class="missing" d="M780 435 H830 V180 H885"/>
+<text class="red small" x="798" y="464">추가 필요</text>
+<rect class="box" x="885" y="395" width="305" height="110" rx="10"/>
+<text class="head" x="905" y="427">DALY BMS · 별도 CAN 250k</text>
+<text x="905" y="459">CAN 트랜시버 경유 → ESP9·8</text>
+<text class="small" x="905" y="485">모듈 전원·절연 경계는 실물 확인</text>
+<path class="ok" d="M1035 365 V395"/>
+<text class="head" x="30" y="607">STM 미수신과 연결되는 소스 차이</text>
+<text x="30" y="638">① Rear PA9 → ESP GPIO18: USART1 송신 추가·적용 후 무선 TPS/IMU/TQV 수신 확인.</text>
+<text x="30" y="667">② 로그가 L=… 및 TV v=… 두 줄. 현재 ESP는 TV 줄을 해석하지 않으므로 포트와 문장 계약을 함께 맞춰야 함.</text>
+<text x="30" y="696">③ 기존 센서 핀맵·제어·DAC 선택 유지. USART1 텔레메트리만 추가. 명령 수신 없음.</text>
+<text class="small" x="30" y="731">정확한 활성 상태·근거·다른 버전과의 차이: TORQUEVECTORING_PINMAP.md</text>
+</svg>

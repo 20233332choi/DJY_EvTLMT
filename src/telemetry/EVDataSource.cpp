@@ -141,6 +141,10 @@ void EVDataSource::ParsePacket(const char* payload, int length) {
         Text(packet, "front_source", next.frontSource, sizeof(next.frontSource));
         next.yawRateRadS = Number<float>(packet, "yaw_rate_rad_s", "yaw_rate", next.yawRateRadS);
         next.lateralAccelMS2 = Number<float>(packet, "lateral_accel_m_s2", "lat_accel", next.lateralAccelMS2);
+        next.longitudinalAccelMS2 = Number<float>(packet, "longitudinal_accel_m_s2", "lon_accel", next.longitudinalAccelMS2);
+        next.imuRawAxMS2 = Number<float>(packet, "imu_raw_ax_m_s2", nullptr, next.imuRawAxMS2);
+        next.imuRawAyMS2 = Number<float>(packet, "imu_raw_ay_m_s2", nullptr, next.imuRawAyMS2);
+        next.imuRawAzMS2 = Number<float>(packet, "imu_raw_az_m_s2", nullptr, next.imuRawAzMS2);
         next.imuOk = Boolean(packet, "imu_ok", false);
         next.imuOnline = Boolean(packet, "imu_online", false);
         next.imuAgeMs = Number<float>(packet, "imu_age_ms", nullptr, -1.0f);
@@ -152,6 +156,8 @@ void EVDataSource::ParsePacket(const char* payload, int length) {
         next.gnssAltitudeM = Number<float>(packet, "gnss_altitude_m", "altitude_m", next.gnssAltitudeM);
         next.gnssHeadingDeg = Number<float>(packet, "gnss_heading_deg", "heading_deg", next.gnssHeadingDeg);
         next.gnssHdop = Number<float>(packet, "gnss_hdop", "hdop", next.gnssHdop);
+        next.gnssAccuracyM = Number<float>(packet, "gnss_accuracy_m", "accuracy_m", next.gnssAccuracyM);
+        Text(packet, "gnss_source", next.gnssSource, sizeof(next.gnssSource));
         next.gnssAgeMs = Number<float>(packet, "gnss_age_ms", nullptr, next.gnssAgeMs);
         if (!std::isfinite(next.gnssLatitudeDeg) || next.gnssLatitudeDeg < -90.0 || next.gnssLatitudeDeg > 90.0 ||
             !std::isfinite(next.gnssLongitudeDeg) || next.gnssLongitudeDeg < -180.0 || next.gnssLongitudeDeg > 180.0) {
@@ -162,6 +168,12 @@ void EVDataSource::ParsePacket(const char* payload, int length) {
         next.powerLeftKw = Number<float>(packet, "power_left_kw", nullptr, next.powerLeftKw);
         next.powerRightKw = Number<float>(packet, "power_right_kw", nullptr, next.powerRightKw);
         next.deltaPowerKw = Number<float>(packet, "delta_power_kw", nullptr, next.deltaPowerKw);
+        next.vehicleSpeedMS = Number<float>(packet, "vehicle_speed_m_s", nullptr, next.vehicleSpeedMS);
+        next.desiredYawRadS = Number<float>(packet, "desired_yaw_rad_s", nullptr, next.desiredYawRadS);
+        next.yawErrorRadS = Number<float>(packet, "yaw_error_rad_s", nullptr, next.yawErrorRadS);
+        next.tractionScale = Number<float>(packet, "traction_scale", nullptr, next.tractionScale);
+        next.edActive = Boolean(packet, "ed_active", next.edActive);
+        next.tqvInternalOnline = Boolean(packet, "tqv_internal_online", false);
         next.rearOutputOnline = Boolean(packet, "rear_output_online", false);
         next.rearOutputAgeMs = Number<float>(packet, "rear_output_age_ms", nullptr, -1.0f);
         next.batterySocPercent = Number<float>(packet, "battery_soc_pct", "soc_pct", next.batterySocPercent);
@@ -245,6 +257,14 @@ void EVDataSource::ParsePacket(const char* payload, int length) {
         Text(packet, "command_message", next.commandMessage, sizeof(next.commandMessage));
         next.commandRequestId = Number<std::uint32_t>(
             packet, "command_request_id", nullptr, next.commandRequestId);
+        next.recordingActive = Boolean(packet, "recording_active", next.recordingActive);
+        next.recordingSessionId = Number<std::uint32_t>(
+            packet, "recording_session_id", nullptr, next.recordingSessionId);
+        next.recordingSampleCount = Number<std::uint64_t>(
+            packet, "recording_sample_count", nullptr, next.recordingSampleCount);
+        next.recordingElapsedS = Number<float>(
+            packet, "recording_elapsed_s", nullptr, next.recordingElapsedS);
+        Text(packet, "database_path", next.databasePath, sizeof(next.databasePath));
 
         const float reportedSpeed = Number<float>(packet, "speed_kmh", "speed", -1.0f);
         next.speedKmh = reportedSpeed >= 0.0f

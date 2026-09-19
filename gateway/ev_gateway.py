@@ -10,20 +10,29 @@ import math
 import os
 import re
 import socket
+import sqlite3
 import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import parse_qs, urlparse
 
 from daly_bms import DalyBmsReader
+from stm_serial import rear_records
+from tuning import CHANNELS, INPUTS as TUNING_INPUTS, TuningStream, project as tuning_project, rpm_status
+from relay_samples import RelaySamples, MAX_BATCH_BYTES
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STEERING_HTML = PROJECT_ROOT / "web" / "steering" / "index.html"
 DRIVER_HTML = PROJECT_ROOT / "web" / "driver" / "index.html"
 TEST_PANEL_HTML = PROJECT_ROOT / "web" / "test" / "index.html"
+PHONE_GNSS_HTML = PROJECT_ROOT / "web" / "phone" / "index.html"
+BATTERY_HTML = PROJECT_ROOT / "web" / "battery.html"
+RECORDS_HTML = PROJECT_ROOT / "web" / "records" / "index.html"
+TUNING_DIR = PROJECT_ROOT / "web" / "tuning"
 GEAR_RATIO = 3.8
 TIRE_RADIUS_M = 0.2286
 VALID_FLAGS = {"CLEAR", "GREEN", "YELLOW", "RED", "STOP", "CHECKERED", "BOX"}
@@ -131,9 +140,13 @@ def normalize_packet(data: Mapping[str, Any]) -> dict[str, Any]:
     rpm_right = max(0, int(_number(data, "rpm_right", "rpm_r")))
     speed = _number(data, "speed_kmh", "speed", default=-1.0)
     if speed < 0:
-        motor_rpm = 0.5 * (rpm_left + rpm_right)
-        wheel_rpm = motor_rpm / GEAR_RATIO
-        speed = wheel_rpm * (2.0 * math.pi * TIRE_RADIUS_M) / 60.0 * 3.6
+        # Do not infer vehicle speed from one missing/noisy wheel.
+        if (rpm_left == 0) != (rpm_right == 0):
+            speed = 0.0
+        else:
+            motor_rpm = 0.5 * (rpm_left + rpm_right)
+            wheel_rpm = motor_rpm / GEAR_RATIO
+            speed = wheel_rpm * (2.0 * math.pi * TIRE_RADIUS_M) / 60.0 * 3.6
 
     power_left = _number(data, "power_left_kw")
     power_right = _number(data, "power_right_kw")
@@ -194,11 +207,19 @@ def normalize_packet(data: Mapping[str, Any]) -> dict[str, Any]:
         "sas_deg": steering_deg,
         "yaw_rate_rad_s": _number(data, "yaw_rate_rad_s", "yaw_rate"),
         "lateral_accel_m_s2": _number(data, "lateral_accel_m_s2", "lat_accel"),
+        "longitudinal_accel_m_s2": _number(data, "longitudinal_accel_m_s2", "lon_accel"),
+        "imu_raw_ax_m_s2": _number(data, "imu_raw_ax_m_s2"),
+        "imu_raw_ay_m_s2": _number(data, "imu_raw_ay_m_s2"),
+        "imu_raw_az_m_s2": _number(data, "imu_raw_az_m_s2"),
         "dac_left": max(0, int(_number(data, "dac_left", "dac_l"))),
         "dac_right": max(0, int(_number(data, "dac_right", "dac_r"))),
         "power_left_kw": power_left,
         "power_right_kw": power_right,
         "delta_power_kw": delta_power,
+        "vehicle_speed_m_s": _number(data, "vehicle_speed_m_s", "vehicle_speed"),
+        "desired_yaw_rad_s": _number(data, "desired_yaw_rad_s", "desired_yaw"),
+        "yaw_error_rad_s": _number(data, "yaw_error_rad_s", "yaw_error"),
+        "traction_scale": max(0.0, min(1.0, _number(data, "traction_scale", default=1.0))),
         "tv_percent": max(-100.0, min(100.0, tv_percent)),
         "tqv_setting_pct": max(
             0.0,
@@ -219,6 +240,7 @@ def normalize_packet(data: Mapping[str, Any]) -> dict[str, Any]:
         "config_ack": _boolean(data, "config_ack"),
         "driver_control_fresh": _boolean(data, "driver_control_fresh"),
         "tv_active": _boolean(data, "tv_active"),
+        "ed_active": _boolean(data, "ed_active"),
         "regen_ready": _boolean(data, "regen_ready"),
         "regen_active": _boolean(data, "regen_active", regen_applied > 0.0),
         "tv_limited": _boolean(data, "tv_limited", tv_applied + 0.5 < tv_requested),
@@ -269,6 +291,7 @@ def normalize_packet(data: Mapping[str, Any]) -> dict[str, Any]:
         "bms_cell_delta_mv": max(0.0, _number(data, "bms_cell_delta_mv")),
         "bms_temp_max_c": _number(data, "bms_temp_max_c"),
         "bms_temp_min_c": _number(data, "bms_temp_min_c"),
+        "bms_life_pct": max(0, min(100, int(_number(data, "bms_life_pct")))),
         "bms_charge_mos_on": _boolean(data, "bms_charge_mos_on"),
         "bms_discharge_mos_on": _boolean(data, "bms_discharge_mos_on"),
         "bms_charger_present": _boolean(data, "bms_charger_present"),
@@ -292,6 +315,8 @@ def normalize_packet(data: Mapping[str, Any]) -> dict[str, Any]:
         "gnss_altitude_m": _number(data, "gnss_altitude_m", "altitude_m"),
         "gnss_heading_deg": _number(data, "gnss_heading_deg", "heading_deg") % 360.0,
         "gnss_hdop": max(0.0, _number(data, "gnss_hdop", "hdop")),
+        "gnss_accuracy_m": max(0.0, _number(data, "gnss_accuracy_m", "accuracy_m")),
+        "gnss_source": str(data.get("gnss_source", "GNSS"))[:31],
         "gnss_age_ms": max(0.0, _number(data, "gnss_age_ms")),
         "lap_time_s": max(0.0, _number(data, "lap_time_s", "current_lap_s")),
         "last_lap_s": max(0.0, _number(data, "last_lap_s")),
@@ -499,9 +524,13 @@ class TelemetryStore:
         "stm_online", "can_ok", "fault_code", "fault", "drive_mode",
         "speed_kmh", "speed", "rpm_left", "rpm_l", "rpm_right", "rpm_r", "tps_raw", "tps_pct",
         "throttle_pct", "sas_raw", "sas_deg", "steering_deg", "yaw_rate_rad_s", "yaw_rate",
-        "lateral_accel_m_s2", "lat_accel", "dac_left", "dac_right", "tv_applied_pct",
+        "lateral_accel_m_s2", "lat_accel", "longitudinal_accel_m_s2", "lon_accel",
+        "imu_raw_ax_m_s2", "imu_raw_ay_m_s2", "imu_raw_az_m_s2", "dac_left", "dac_right", "tv_applied_pct",
     )
     SIGNAL_GROUPS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+        "pid": (("pid_kp", "pid_ki", "pid_kd", "pid_online"), ("pid_kp", "pid_ki", "pid_kd")),
+        "motor_left_voltage": (("motor_left_voltage_v",), ("motor_left_voltage_v",)),
+        "motor_right_voltage": (("motor_right_voltage_v",), ("motor_right_voltage_v",)),
         "speed": (("speed_kmh", "speed"), ("speed_kmh",)),
         "rpm_left": (
             ("rpm_left", "rpm_l", "cap_left", "capture_left", "motor_left_ok"),
@@ -511,6 +540,10 @@ class TelemetryStore:
             ("rpm_right", "rpm_r", "cap_right", "capture_right", "motor_right_ok"),
             ("rpm_right", "cap_right", "motor_right_ok"),
         ),
+        "rpm_left_reported": (("rpm_left_reported",), ("rpm_left_reported", "rpm_left_quality", "rpm_left_rejected_pct")),
+        "rpm_right_reported": (("rpm_right_reported",), ("rpm_right_reported", "rpm_right_quality", "rpm_right_rejected_pct")),
+        "rpm_left_target": (("rpm_left_target",), ("rpm_left_target",)),
+        "rpm_right_target": (("rpm_right_target",), ("rpm_right_target",)),
         "tps": (
             ("tps_raw", "tps_pct", "throttle_pct", "tps_ok"),
             ("tps_raw", "tps_pct", "tps_ok"),
@@ -521,16 +554,22 @@ class TelemetryStore:
             ("sas_raw", "sas_center_raw", "sas_absolute_deg", "sas_relative_deg", "sas_deg", "sas_ok"),
         ),
         "imu": (
-            ("yaw_rate_rad_s", "yaw_rate", "lateral_accel_m_s2", "lat_accel", "imu_ok"),
-            ("yaw_rate_rad_s", "lateral_accel_m_s2", "imu_ok"),
+            ("yaw_rate_rad_s", "yaw_rate", "lateral_accel_m_s2", "lat_accel",
+             "longitudinal_accel_m_s2", "lon_accel", "imu_ok"),
+            ("yaw_rate_rad_s", "lateral_accel_m_s2", "longitudinal_accel_m_s2", "imu_ok"),
         ),
         "rear_output": (
-            ("dac_left", "dac_l", "dac_right", "dac_r", "power_left_kw", "power_right_kw",
-             "delta_power_kw", "tv_requested_pct", "tv_applied_pct", "regen_requested_pct",
-             "regen_applied_pct", "rear_status_seq"),
-            ("dac_left", "dac_right", "power_left_kw", "power_right_kw", "delta_power_kw",
-             "tv_requested_pct", "tv_applied_pct", "regen_requested_pct", "regen_applied_pct",
+            ("dac_left", "dac_l", "dac_right", "dac_r", "tv_requested_pct", "tv_applied_pct",
+             "regen_requested_pct", "regen_applied_pct", "rear_status_seq"),
+            ("dac_left", "dac_right", "tv_requested_pct", "tv_applied_pct",
+             "regen_requested_pct", "regen_applied_pct",
              "rear_status_seq", "tv_active", "regen_ready", "regen_active", "tv_limited", "regen_limited"),
+        ),
+        "tqv_internal": (
+            ("vehicle_speed_m_s", "desired_yaw_rad_s", "yaw_error_rad_s", "delta_power_kw",
+             "power_left_kw", "power_right_kw", "traction_scale", "ed_active"),
+            ("vehicle_speed_m_s", "desired_yaw_rad_s", "yaw_error_rad_s", "delta_power_kw",
+             "power_left_kw", "power_right_kw", "traction_scale", "ed_active"),
         ),
         "bms": (
             ("battery_soc_pct", "soc_pct", "battery_pct", "battery_pack_voltage_v", "pack_voltage_v",
@@ -555,12 +594,22 @@ class TelemetryStore:
         self._arrivals: list[float] = []
         self._signal_last: dict[str, float] = {}
         self._signal_reported_online: dict[str, bool] = {}
+        self._tuning_seen: dict[str, tuple[float, float | None]] = {}
 
     def update(self, data: Mapping[str, Any], now: float | None = None) -> dict[str, Any]:
         timestamp = time.monotonic() if now is None else now
         normalized = normalize_packet(data)
         with self._lock:
-            packet = dict(normalized)
+            # Keep the complete received object for the session recorder while
+            # canonical normalized names remain authoritative for the UI.
+            packet = dict(data)
+            packet.update(normalized)
+            for key, names in TUNING_INPUTS.items():
+                if any(name in data for name in names):
+                    valid = any(isinstance(data.get(name), (int, float))
+                                and (not isinstance(data.get(name), bool) or key in ('tv_active', 'ed_active'))
+                                and math.isfinite(data[name]) for name in names)
+                    self._tuning_seen[key] = (timestamp, packet.get(key) if valid else None)
             for group, (input_names, output_names) in self.SIGNAL_GROUPS.items():
                 present = any(name in data for name in input_names)
                 if present:
@@ -580,7 +629,9 @@ class TelemetryStore:
                 self._last_seq = sequence
             self._received += 1
             self._last_monotonic = timestamp
-            if any(name in data for name in self.VEHICLE_INPUTS):
+            vehicle_fields_present = any(name in data for name in self.VEHICLE_INPUTS)
+            stm_explicitly_offline = "stm_online" in data and not bool(data["stm_online"])
+            if vehicle_fields_present and not stm_explicitly_offline:
                 self._vehicle_last_monotonic = timestamp
             self._arrivals.append(timestamp)
             cutoff = timestamp - 2.0
@@ -588,19 +639,27 @@ class TelemetryStore:
             self._packet = packet
             return dict(packet)
 
-    def snapshot(self, now: float | None = None) -> dict[str, Any]:
+    def snapshot(self, now: float | None = None, include_delivery_delay: bool = True) -> dict[str, Any]:
         timestamp = time.monotonic() if now is None else now
         with self._lock:
-            age = None if self._vehicle_last_monotonic is None else max(0.0, timestamp - self._vehicle_last_monotonic)
+            delay = max(0.0, _number(self._packet, 'sample_age_at_receive_ms')) / 1000.0 if include_delivery_delay else 0.0
+            age = None if self._vehicle_last_monotonic is None else max(0.0, timestamp - self._vehicle_last_monotonic) + delay
             rate = 0.0
             if len(self._arrivals) > 1:
                 span = self._arrivals[-1] - self._arrivals[0]
                 if span > 0:
                     rate = (len(self._arrivals) - 1) / span
             result = dict(self._packet)
+            if delay >= 1.5:
+                result['stm_online'] = False
+                result['live_control_allowed'] = False
+            result['_tuning_values'] = {
+                key: value if timestamp - seen + delay < 1.5 else None
+                for key, (seen, value) in self._tuning_seen.items()
+            }
             for group in self.SIGNAL_GROUPS:
                 last = self._signal_last.get(group)
-                signal_age = None if last is None else max(0.0, timestamp - last)
+                signal_age = None if last is None else max(0.0, timestamp - last) + delay
                 reported_age = result.get(f"{group}_age_ms", 0.0)
                 if not isinstance(reported_age, (int, float)):
                     reported_age = 0.0
@@ -623,17 +682,272 @@ class TelemetryStore:
                     "receive_rate_hz": round(rate, 2),
                 }
             )
+            if not result['vehicle_online']:
+                result['stm_online'] = False
             return result
+
+
+class TelemetryDatabase:
+    """Session-based SQLite recorder. payload_json preserves every telemetry field."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path).resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._connection = sqlite3.connect(self.path, check_same_thread=False)
+        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA synchronous=NORMAL")
+        self._connection.execute("PRAGMA foreign_keys=ON")
+        self._connection.executescript("""
+            CREATE TABLE IF NOT EXISTS measurement_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at_utc TEXT NOT NULL,
+                stopped_at_utc TEXT,
+                label TEXT NOT NULL DEFAULT '',
+                sample_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS telemetry_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                captured_at_utc TEXT NOT NULL,
+                source_timestamp_ms INTEGER,
+                sequence INTEGER,
+                vehicle_speed_m_s REAL,
+                speed_kmh REAL,
+                rpm_left INTEGER,
+                rpm_right INTEGER,
+                tps_raw INTEGER,
+                tps_pct REAL,
+                sas_raw INTEGER,
+                sas_deg REAL,
+                yaw_rate_rad_s REAL,
+                lateral_accel_m_s2 REAL,
+                longitudinal_accel_m_s2 REAL,
+                imu_raw_ax_m_s2 REAL,
+                imu_raw_ay_m_s2 REAL,
+                imu_raw_az_m_s2 REAL,
+                desired_yaw_rad_s REAL,
+                yaw_error_rad_s REAL,
+                delta_power_kw REAL,
+                power_left_kw REAL,
+                power_right_kw REAL,
+                traction_scale REAL,
+                tv_active INTEGER,
+                ed_active INTEGER,
+                dac_left INTEGER,
+                dac_right INTEGER,
+                battery_soc_pct REAL,
+                battery_pack_voltage_v REAL,
+                battery_current_a REAL,
+                battery_power_kw REAL,
+                gnss_latitude_deg REAL,
+                gnss_longitude_deg REAL,
+                gnss_altitude_m REAL,
+                gnss_heading_deg REAL,
+                gnss_accuracy_m REAL,
+                wifi_rssi_dbm INTEGER,
+                fault_code INTEGER,
+                telemetry_transport TEXT,
+                payload_json TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES measurement_sessions(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_telemetry_samples_session
+                ON telemetry_samples(session_id, id);
+        """)
+        self._connection.commit()
+        self._session_id: int | None = None
+        self._started_epoch: float | None = None
+        self._sample_count = 0
+
+    @staticmethod
+    def _utc_text(epoch: float | None = None) -> str:
+        value = time.time() if epoch is None else epoch
+        seconds, milliseconds = divmod(round(value * 1000), 1000)
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + f".{milliseconds:03d}Z"
+
+    def start(self, label: str = "") -> dict[str, Any]:
+        with self._lock:
+            if self._session_id is not None:
+                return self._status_locked()
+            started = time.time()
+            cursor = self._connection.execute(
+                "INSERT INTO measurement_sessions(started_at_utc,label) VALUES(?,?)",
+                (self._utc_text(started), str(label)[:80]),
+            )
+            self._connection.commit()
+            self._session_id = int(cursor.lastrowid)
+            self._started_epoch = started
+            self._sample_count = 0
+            return self._status_locked()
+
+    def stop(self) -> dict[str, Any]:
+        with self._lock:
+            if self._session_id is not None:
+                self._connection.execute(
+                    "UPDATE measurement_sessions SET stopped_at_utc=?,sample_count=? WHERE id=?",
+                    (self._utc_text(), self._sample_count, self._session_id),
+                )
+                self._connection.commit()
+                self._session_id = None
+                self._started_epoch = None
+            return self._status_locked()
+
+    def record(self, packet: Mapping[str, Any]) -> None:
+        with self._lock:
+            if self._session_id is None:
+                return
+            values = (
+                self._session_id, self._utc_text(_number(packet, 'sample_time_ms') / 1000.0)
+                if 'sample_time_ms' in packet else self._utc_text(), int(_number(packet, "timestamp_ms")),
+                int(_number(packet, "seq")), _number(packet, "vehicle_speed_m_s"),
+                _number(packet, "speed_kmh"), int(_number(packet, "rpm_left")),
+                int(_number(packet, "rpm_right")), int(_number(packet, "tps_raw")),
+                _number(packet, "tps_pct"), int(_number(packet, "sas_raw")),
+                _number(packet, "sas_deg"), _number(packet, "yaw_rate_rad_s"),
+                _number(packet, "lateral_accel_m_s2"), _number(packet, "longitudinal_accel_m_s2"),
+                _number(packet, "imu_raw_ax_m_s2"), _number(packet, "imu_raw_ay_m_s2"),
+                _number(packet, "imu_raw_az_m_s2"), _number(packet, "desired_yaw_rad_s"),
+                _number(packet, "yaw_error_rad_s"), _number(packet, "delta_power_kw"),
+                _number(packet, "power_left_kw"), _number(packet, "power_right_kw"),
+                _number(packet, "traction_scale", default=1.0), int(_boolean(packet, "tv_active")),
+                int(_boolean(packet, "ed_active")), int(_number(packet, "dac_left")),
+                int(_number(packet, "dac_right")), _number(packet, "battery_soc_pct"),
+                _number(packet, "battery_pack_voltage_v"), _number(packet, "battery_current_a"),
+                _number(packet, "battery_power_kw"), _number(packet, "gnss_latitude_deg"),
+                _number(packet, "gnss_longitude_deg"), _number(packet, "gnss_altitude_m"),
+                _number(packet, "gnss_heading_deg"), _number(packet, "gnss_accuracy_m"),
+                int(_number(packet, "wifi_rssi_dbm", default=-127.0)), int(_number(packet, "fault_code")),
+                str(packet.get("telemetry_transport", ""))[:24],
+                json.dumps(dict(packet), ensure_ascii=False, separators=(",", ":")),
+            )
+            self._connection.execute(
+                """INSERT INTO telemetry_samples(
+                    session_id,captured_at_utc,source_timestamp_ms,sequence,
+                    vehicle_speed_m_s,speed_kmh,rpm_left,rpm_right,tps_raw,tps_pct,sas_raw,sas_deg,
+                    yaw_rate_rad_s,lateral_accel_m_s2,longitudinal_accel_m_s2,
+                    imu_raw_ax_m_s2,imu_raw_ay_m_s2,imu_raw_az_m_s2,
+                    desired_yaw_rad_s,yaw_error_rad_s,delta_power_kw,power_left_kw,power_right_kw,
+                    traction_scale,tv_active,ed_active,dac_left,dac_right,
+                    battery_soc_pct,battery_pack_voltage_v,battery_current_a,battery_power_kw,
+                    gnss_latitude_deg,gnss_longitude_deg,gnss_altitude_m,gnss_heading_deg,
+                    gnss_accuracy_m,wifi_rssi_dbm,fault_code,telemetry_transport,payload_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                values,
+            )
+            self._sample_count += 1
+            self._connection.execute(
+                "UPDATE measurement_sessions SET sample_count=? WHERE id=?",
+                (self._sample_count, self._session_id),
+            )
+            self._connection.commit()
+
+    def _status_locked(self) -> dict[str, Any]:
+        return {
+            "recording_active": self._session_id is not None,
+            "recording_session_id": self._session_id or 0,
+            "recording_sample_count": self._sample_count,
+            "recording_elapsed_s": 0.0 if self._started_epoch is None else max(0.0, time.time() - self._started_epoch),
+            "database_path": str(self.path),
+        }
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return self._status_locked()
+
+    def list_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(500, int(limit)))
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT id,started_at_utc,stopped_at_utc,label,sample_count
+                   FROM measurement_sessions ORDER BY id DESC LIMIT ?""",
+                (safe_limit,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row[0]),
+                "started_at_utc": row[1],
+                "stopped_at_utc": row[2],
+                "label": row[3],
+                "sample_count": int(row[4]),
+            }
+            for row in rows
+        ]
+
+    def list_samples(self, session_id: int, limit: int = 250,
+                     offset: int = 0) -> dict[str, Any]:
+        safe_session_id = max(1, int(session_id))
+        safe_limit = max(1, min(1000, int(limit)))
+        safe_offset = max(0, int(offset))
+        with self._lock:
+            total_row = self._connection.execute(
+                "SELECT COUNT(*) FROM telemetry_samples WHERE session_id=?",
+                (safe_session_id,),
+            ).fetchone()
+            rows = self._connection.execute(
+                """SELECT id,captured_at_utc,payload_json
+                   FROM telemetry_samples WHERE session_id=?
+                   ORDER BY id DESC LIMIT ? OFFSET ?""",
+                (safe_session_id, safe_limit, safe_offset),
+            ).fetchall()
+        rows.reverse()
+        samples: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                telemetry = json.loads(row[2])
+            except (TypeError, json.JSONDecodeError):
+                telemetry = {}
+            samples.append({
+                "id": int(row[0]),
+                "captured_at_utc": row[1],
+                "telemetry": telemetry,
+            })
+        return {
+            "session_id": safe_session_id,
+            "total": int(total_row[0]) if total_row is not None else 0,
+            "limit": safe_limit,
+            "offset": safe_offset,
+            "samples": samples,
+        }
+
+    def close(self) -> None:
+        self.stop()
+        with self._lock:
+            self._connection.close()
+
+    def tuning_samples(self, session_id: int, after: int = 0, through: int = 0,
+                       limit: int = 1000) -> dict[str, Any]:
+        """Keyset pages frozen at through; recording cannot shift history pages."""
+        with self._lock:
+            if not through:
+                through = self._connection.execute(
+                    "SELECT COALESCE(MAX(id),0) FROM telemetry_samples WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()[0]
+            rows = self._connection.execute(
+                "SELECT id,captured_at_utc,source_timestamp_ms,payload_json FROM telemetry_samples "
+                "WHERE session_id=? AND id>? AND id<=? ORDER BY id LIMIT ?",
+                (session_id, after, through, max(1, min(1000, limit))),
+            ).fetchall()
+        from datetime import datetime
+        samples = [{"id": row[0],
+                    "time_ms": round(datetime.fromisoformat(row[1].replace("Z", "+00:00")).timestamp() * 1000),
+                    "source_timestamp_ms": row[2], "values": tuning_project(json.loads(row[3])),
+                    "status": rpm_status(json.loads(row[3]))}
+                   for row in rows]
+        return {"samples": samples, "through": through,
+                "cursor": samples[-1]["id"] if samples else after,
+                "more": bool(samples and samples[-1]["id"] < through)}
 
 
 class EVGateway:
     def __init__(self, listen_host: str, listen_port: int, pit_host: str, pit_port: int,
                  enable_control: bool = False, command_port: int = 9006,
-                 relay_token: str = "") -> None:
+                 relay_token: str = "", database_path: str | Path | None = None) -> None:
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.pit_target = (pit_host, pit_port)
         self.store = TelemetryStore()
+        self.tuning = TuningStream()
         self.display_test = DisplayTestState()
         self.stop_event = threading.Event()
         self.forward_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -641,6 +955,7 @@ class EVGateway:
         self.enable_control = enable_control
         self.command_port = command_port
         self.relay_token = relay_token.strip()
+        self.database = TelemetryDatabase(database_path) if database_path is not None else None
         self.latest_udp_sender: tuple[str, int] | None = None
         self.serial_stream: Any | None = None
         self.serial_lock = threading.Lock()
@@ -651,6 +966,9 @@ class EVGateway:
         self.bms_state: dict[str, Any] = {}
         self.bms_last_monotonic: float | None = None
         self.bms_configured = False
+        self.gnss_lock = threading.Lock()
+        self.gnss_state: dict[str, Any] = {}
+        self.gnss_last_monotonic: float | None = None
         self.command_lock = threading.Lock()
         self.command_state: dict[str, Any] = {
             "gateway_control_enabled": enable_control,
@@ -668,7 +986,11 @@ class EVGateway:
         self.transport_lock = threading.Lock()
         self.transport_last: dict[str, float] = {}
         self.active_transport = "NONE"
+        self.input_mode = "WIFI_UDP"
+        self.input_port = ""
         self.relay_lock = threading.Lock()
+        self.relay_ingest_lock = threading.Lock()
+        self.relay_samples = RelaySamples()
         self.relay_pending_command: dict[str, Any] | None = None
         self.relay_pending_until = 0.0
         self.relay_vehicle_id = ""
@@ -717,17 +1039,26 @@ class EVGateway:
         return True
 
     def _forward_snapshot(self) -> None:
+        # Archives keep capture-time validity, even after an internet outage.
+        # Live widgets separately expire delayed samples instead of presenting
+        # historical replay as a currently healthy vehicle.
+        snapshot = self.snapshot(include_delivery_delay=False)
+        self.tuning.append(snapshot)
+        if self.database is not None:
+            self.database.record(snapshot)
         payload = json.dumps(self.snapshot(), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         with self.forward_lock:
             self.forward_socket.sendto(payload, self.pit_target)
 
-    def snapshot(self, include_display_test: bool = False) -> dict[str, Any]:
-        result = self.store.snapshot()
+    def snapshot(self, include_display_test: bool = False, include_delivery_delay: bool = True) -> dict[str, Any]:
+        result = self.store.snapshot(include_delivery_delay=include_delivery_delay)
         now = time.monotonic()
         with self.transport_lock:
             active_transport = self.active_transport
             transport_last = dict(self.transport_last)
         result.update({
+            "input_mode": self.input_mode,
+            "input_port": self.input_port,
             "telemetry_transport": active_transport,
             "usb_link_online": now - transport_last.get("USB", 0.0) < 1.5,
             "wifi_udp_link_online": now - transport_last.get("WIFI_UDP", 0.0) < 1.5,
@@ -747,6 +1078,9 @@ class EVGateway:
             result["front_direct_age_ms"] = round(front_age * 1000.0, 1)
             if front_fresh:
                 result.update(front_state)
+                for key in ('tps_pct', 'sas_deg'):
+                    if key in front_state:
+                        result['_tuning_values'][key] = front_state[key]
                 if any(name in front_state for name in ("tps_raw", "tps_pct", "tps_ok")):
                     result["tps_online"] = True
                     result["tps_age_ms"] = round(front_age * 1000.0, 1)
@@ -763,6 +1097,14 @@ class EVGateway:
             bms_state["bms_age_ms"] = 0.0 if bms_age is None else round(bms_age * 1000.0, 1)
             bms_state["bms_ok"] = bms_state["bms_online"] and not bool(bms_state.get("bms_fault"))
             result.update(bms_state)
+        with self.gnss_lock:
+            gnss_state = dict(self.gnss_state)
+            gnss_last = self.gnss_last_monotonic
+        if gnss_last is not None:
+            gnss_age = max(0.0, time.monotonic() - gnss_last)
+            gnss_state["gnss_online"] = gnss_age < 3.0
+            gnss_state["gnss_age_ms"] = round(gnss_age * 1000.0, 1)
+            result.update(gnss_state)
         if include_display_test:
             result.update(self.display_test.snapshot(float(result.get("tps_pct", 0.0))))
         with self.command_lock:
@@ -775,6 +1117,16 @@ class EVGateway:
                 self.relay_ping_deadline = 0.0
             command_state = dict(self.command_state)
         result.update(command_state)
+        if self.database is not None:
+            result.update(self.database.status())
+        else:
+            result.update({
+                "recording_active": False,
+                "recording_session_id": 0,
+                "recording_sample_count": 0,
+                "recording_elapsed_s": 0.0,
+                "database_path": "",
+            })
         if (
             command_state.get("command_status") == "ACKED"
             and int(result.get("config_seq", -1)) == int(command_state["command_expected_seq"])
@@ -782,17 +1134,77 @@ class EVGateway:
             result["config_ack"] = True
         return result
 
+    def set_recording(self, active: bool, label: str = "") -> dict[str, Any]:
+        if self.database is None:
+            raise ValueError("telemetry database is disabled")
+        if active:
+            status = self.database.start(label)
+            self._forward_snapshot()
+            return status
+        # Preserve the last known values at the requested stop boundary.
+        self.database.record(self.snapshot())
+        status = self.database.stop()
+        self._forward_snapshot()
+        return status
+
+    def update_phone_gnss(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        lat = _number(data, "lat", "latitude", default=math.nan)
+        lon = _number(data, "lon", "longitude", default=math.nan)
+        if not math.isfinite(lat) or not -90.0 <= lat <= 90.0:
+            raise ValueError("invalid latitude")
+        if not math.isfinite(lon) or not -180.0 <= lon <= 180.0:
+            raise ValueError("invalid longitude")
+
+        accuracy = max(0.0, _number(data, "accuracy_m", "accuracy", default=999.0))
+        if accuracy > 100.0:
+            raise ValueError("GPS accuracy is worse than 100 m")
+        altitude = _number(data, "altitude", "altitude_m", default=0.0)
+        speed = max(0.0, _number(data, "speed_kmh", default=0.0))
+        heading = _number(data, "heading", "heading_deg", default=0.0) % 360.0
+        now = time.monotonic()
+        state = {
+            "gnss_online": True,
+            "gnss_fix_type": 3 if any(name in data for name in ("altitude", "altitude_m")) else 2,
+            "gnss_satellites": 0,
+            "gnss_latitude_deg": lat,
+            "gnss_longitude_deg": lon,
+            "gnss_altitude_m": altitude,
+            "gnss_heading_deg": heading,
+            "gnss_hdop": 0.0,
+            "gnss_accuracy_m": accuracy,
+            "gnss_source": "PHONE GPS",
+        }
+        with self.gnss_lock:
+            self.gnss_state = state
+            self.gnss_last_monotonic = now
+        self._forward_snapshot()
+        return {
+            "accepted": True,
+            "accuracy_m": round(accuracy, 1),
+            "speed_kmh": round(speed, 1),
+            "gnss_online": True,
+        }
+
     def relay_authorized(self, authorization: str) -> bool:
         if not self.relay_token:
             return False
         return hmac.compare_digest(authorization.strip(), f"Bearer {self.relay_token}")
 
     def relay_exchange(self, data: Mapping[str, Any], vehicle_id: str = "EV") -> dict[str, Any]:
-        telemetry = data.get("telemetry", data)
-        if not isinstance(telemetry, Mapping):
-            raise ValueError("telemetry JSON object required")
         self.relay_vehicle_id = re.sub(r"[^A-Za-z0-9_.-]", "", vehicle_id)[:32] or "EV"
-        self.accept(telemetry, transport="INTERNET_RELAY")
+        ack = None
+        accepted = 0
+        with self.relay_ingest_lock:
+            if 'samples' in data:
+                key, samples, ack, clock = self.relay_samples.prepare(data, self.relay_vehicle_id)
+                for sample in samples:
+                    accepted += int(self.accept(sample, transport='INTERNET_RELAY'))
+                self.relay_samples.commit(key, ack, clock)
+            else:
+                telemetry = data.get("telemetry", data)
+                if not isinstance(telemetry, Mapping):
+                    raise ValueError("telemetry JSON object required")
+                accepted = int(self.accept(telemetry, transport="INTERNET_RELAY"))
         now = time.monotonic()
         with self.relay_lock:
             command = (
@@ -804,6 +1216,8 @@ class EVGateway:
                 self.relay_pending_command = None
         return {
             "ok": True,
+            "ack_seq": ack,
+            "accepted_samples": accepted,
             "server_time_ms": int(time.time() * 1000.0),
             "vehicle_id": self.relay_vehicle_id,
             "command": command,
@@ -901,6 +1315,8 @@ class EVGateway:
         return {"ok": not rejection, **self.command_state}
 
     def _send_vehicle_command(self, command: Mapping[str, Any]) -> str:
+        if self.input_mode == "STM_USB":
+            return ""  # Rear ST-Link is strictly a read-only diagnostic input.
         encoded = (json.dumps(command, separators=(",", ":")) + "\n").encode("utf-8")
         with self.serial_lock:
             stream = self.serial_stream
@@ -979,6 +1395,11 @@ class EVGateway:
 
     def submit_control(self, data: Mapping[str, Any]) -> dict[str, Any]:
         command_type = str(data.get("type", "")).strip().lower()
+        if command_type in {"recording_start", "recording_stop"}:
+            return {
+                "ok": True,
+                **self.set_recording(command_type == "recording_start", str(data.get("label", ""))),
+            }
         if command_type == "relay_ping":
             request_id = max(0, int(_number(data, "request_id"))) & 0xFF
             rejection = ""
@@ -1060,7 +1481,7 @@ class EVGateway:
                 try:
                     decoded = json.loads(payload.decode("utf-8"))
                     if isinstance(decoded, dict) and decoded.get("type") in {
-                        "pit_config", "live_tv", "relay_ping"
+                        "pit_config", "live_tv", "relay_ping", "recording_start", "recording_stop"
                     }:
                         self.submit_control(decoded)
                 except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
@@ -1081,6 +1502,25 @@ class EVGateway:
                         self.accept(decoded, _sender, transport="WIFI_UDP")
                 except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                     continue
+
+    def rear_serial_loop(self, port: str, baud: int) -> None:
+        import serial
+
+        while not self.stop_event.is_set():
+            try:
+                # Configure modem lines BEFORE opening: never request a reset.
+                stream = serial.Serial(port=None, baudrate=baud, timeout=0.25)
+                stream.dtr = False
+                stream.rts = False
+                stream.port = port
+                stream.open()
+                with stream:
+                    for packet in rear_records(stream, self.stop_event):
+                        # Never expose this stream to the ESP command writer.
+                        self.accept(packet, transport="USB")
+            except (serial.SerialException, OSError) as exc:
+                print(f"Rear USB {port}: {exc}; retrying", flush=True)
+                self.stop_event.wait(1.0)
 
     def serial_loop(self, port: str, baud: int) -> None:
         try:
@@ -1169,14 +1609,83 @@ def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Connection", "close")
+            # Only a fully consumed, authenticated vehicle exchange may reuse
+            # its connection. Rejected requests still close (body unread).
+            keep_alive = (
+                self.command == "POST"
+                and self.path.split("?", 1)[0] == "/api/vehicle/exchange"
+                and status == HTTPStatus.OK
+                and self.request_version == "HTTP/1.1"
+                and self.headers.get("Connection", "").lower() != "close"
+            )
+            self.send_header("Connection", "keep-alive" if keep_alive else "close")
             self.end_headers()
             self.wfile.write(body)
             self.wfile.flush()
-            self.close_connection = True
+            self.close_connection = not keep_alive
+            if keep_alive:
+                self.connection.settimeout(5.0)
 
         def do_GET(self) -> None:  # noqa: N802
-            path = self.path.split("?", 1)[0]
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path in {"/", "/pit", "/pit/", "/tuning", "/tuning/", "/tuning/app.js"}:
+                asset = "app.js" if path.endswith(".js") else "index.html"
+                self._send((TUNING_DIR / asset).read_bytes(),
+                           "text/javascript; charset=utf-8" if asset.endswith(".js") else "text/html; charset=utf-8")
+                return
+            if path in {"/battery", "/battery/"}:
+                self._send(BATTERY_HTML.read_bytes(), "text/html; charset=utf-8")
+                return
+            # Team sharing exposes measured channels only; raw records and
+            # command/recording writes retain their existing local-only guard.
+            if path.startswith("/api/tuning/"):
+                try:
+                    query = parse_qs(parsed.query)
+                    if path == "/api/tuning/live":
+                        result = gateway.tuning.read(max(0, int(query.get("after", ["0"])[0])))
+                        snapshot = gateway.snapshot()
+                        result.update({"now_ms": time.time_ns() // 1000000,
+                                       "current": tuning_project(snapshot),
+                                       "current_status": rpm_status(snapshot),
+                                       "input_mode": snapshot["input_mode"],
+                                       "input_port": snapshot["input_port"],
+                                       "input_online": snapshot["usb_link_online"] if snapshot["input_mode"] in {"STM_USB", "ESP_USB"} else snapshot["online"],
+                                       "receive_rate_hz": snapshot["receive_rate_hz"],
+                                       "relay_dropped_samples": snapshot.get('relay_dropped_samples', 0),
+                                       "signal_warning": str(snapshot.get("signal_warning", ""))[:240],
+                                       "recording_active": snapshot["recording_active"],
+                                       "recording_session_id": snapshot["recording_session_id"],
+                                       "recording_sample_count": snapshot["recording_sample_count"],
+                                       "can_record": is_local_http_request(self.client_address[0], self.headers),
+                                       "channels": [{"key": c[0], "label": c[1], "unit": c[2], "group": c[3]} for c in CHANNELS]})
+                    elif path == "/api/tuning/overview":
+                        snapshot = gateway.snapshot()
+                        keys = ("stm_online", "imu_online", "tqv_internal_online", "tv_active",
+                                "speed_online", "speed_kmh", "bms_online", "battery_pack_voltage_v",
+                                "battery_soc_pct", "battery_current_a", "bms_cell_voltages_v",
+                                "gnss_online", "gnss_latitude_deg", "gnss_longitude_deg", "gnss_accuracy_m")
+                        result = {key: snapshot.get(key) for key in keys}
+                    elif path == "/api/tuning/sessions":
+                        result = {"sessions": [] if gateway.database is None else gateway.database.list_sessions(500)}
+                    elif path == "/api/tuning/samples":
+                        if gateway.database is None:
+                            self._send(b'{"error":"database disabled"}', "application/json", HTTPStatus.SERVICE_UNAVAILABLE)
+                            return
+                        sid = int(query.get("session_id", ["0"])[0])
+                        after = int(query.get("after", ["0"])[0])
+                        through = int(query.get("through", ["0"])[0])
+                        if sid <= 0 or after < 0 or through < 0:
+                            raise ValueError("invalid history cursor")
+                        result = gateway.database.tuning_samples(sid, after, through)
+                    else:
+                        self._send(b"not found", "text/plain", HTTPStatus.NOT_FOUND)
+                        return
+                    self._send(json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8"),
+                               "application/json; charset=utf-8")
+                except ValueError:
+                    self._send(b'{"error":"invalid query"}', "application/json", HTTPStatus.BAD_REQUEST)
+                return
             if path in {"/", "/driver", "/driver/", "/steering", "/steering/"}:
                 self._send(STEERING_HTML.read_bytes(), "text/html; charset=utf-8")
                 return
@@ -1185,6 +1694,61 @@ def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
                 return
             if path in {"/test", "/test/", "/controls"}:
                 self._send(TEST_PANEL_HTML.read_bytes(), "text/html; charset=utf-8")
+                return
+            if path in {"/phone", "/phone/", "/gps"}:
+                self._send(PHONE_GNSS_HTML.read_bytes(), "text/html; charset=utf-8")
+                return
+            if path in {
+                "/records", "/records/", "/api/recording/status",
+                "/api/recording/sessions", "/api/recording/samples",
+            } and not is_local_http_request(self.client_address[0], self.headers):
+                self._send(b"local pit client required", "text/plain", HTTPStatus.FORBIDDEN)
+                return
+            if path in {"/records", "/records/"}:
+                self._send(RECORDS_HTML.read_bytes(), "text/html; charset=utf-8")
+                return
+            if path == "/api/recording/status":
+                body = json.dumps(
+                    gateway.database.status() if gateway.database is not None else {
+                        "recording_active": False,
+                        "recording_session_id": 0,
+                        "recording_sample_count": 0,
+                        "recording_elapsed_s": 0.0,
+                        "database_path": "",
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self._send(body, "application/json; charset=utf-8")
+                return
+            if path == "/api/recording/sessions":
+                sessions = [] if gateway.database is None else gateway.database.list_sessions()
+                self._send(
+                    json.dumps({"sessions": sessions}, ensure_ascii=False).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
+                return
+            if path == "/api/recording/samples":
+                if gateway.database is None:
+                    self._send(b'{"error":"database disabled"}', "application/json",
+                               HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
+                query = parse_qs(parsed.query)
+                try:
+                    session_id = int(query.get("session_id", ["0"])[0])
+                    limit = int(query.get("limit", ["250"])[0])
+                    offset = int(query.get("offset", ["0"])[0])
+                    if session_id <= 0:
+                        raise ValueError("session_id must be positive")
+                    body = json.dumps(
+                        gateway.database.list_samples(session_id, limit, offset),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    self._send(body, "application/json; charset=utf-8")
+                except ValueError as exc:
+                    self._send(
+                        json.dumps({"error": str(exc)}, ensure_ascii=False).encode("utf-8"),
+                        "application/json; charset=utf-8", HTTPStatus.BAD_REQUEST,
+                    )
                 return
             if path == "/api/telemetry":
                 body = json.dumps(
@@ -1199,7 +1763,7 @@ def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
-            if path not in {"/api/test", "/api/control", "/api/vehicle/exchange"}:
+            if path not in {"/api/test", "/api/control", "/api/vehicle/exchange", "/api/gnss"}:
                 self._send(b"not found", "text/plain", HTTPStatus.NOT_FOUND)
                 return
             if path in {"/api/test", "/api/control"} and not is_local_http_request(
@@ -1216,7 +1780,7 @@ def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
                 self._send(b"relay authorization required", "text/plain", HTTPStatus.UNAUTHORIZED)
                 return
             try:
-                maximum = 8192 if path == "/api/vehicle/exchange" else 4096
+                maximum = MAX_BATCH_BYTES if path == "/api/vehicle/exchange" else 4096
                 length = max(0, int(self.headers.get("Content-Length", "0")))
                 if length > maximum:
                     raise ValueError("request body too large")
@@ -1227,6 +1791,8 @@ def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
                     result = gateway.display_test.apply(payload)
                 elif path == "/api/control":
                     result = gateway.submit_control(payload)
+                elif path == "/api/gnss":
+                    result = gateway.update_phone_gnss(payload)
                 else:
                     result = gateway.relay_exchange(payload, self.headers.get("X-Vehicle-ID", "EV"))
                 self._send(
@@ -1261,7 +1827,9 @@ def main() -> int:
                         help="environment variable containing the vehicle HTTPS relay token")
     parser.add_argument("--enable-control", action="store_true",
                         help="allow stationary PIT ENABLE configuration commands")
-    parser.add_argument("--serial", metavar="PORT", help="read ESP32 JSON lines, e.g. COM8")
+    serial_input = parser.add_mutually_exclusive_group()
+    serial_input.add_argument("--serial", metavar="PORT", help="read ESP32 JSON lines, e.g. COM8")
+    serial_input.add_argument("--rear-serial", metavar="PORT", help="read-only Rear STM ST-Link text records, e.g. COM13")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--front-serial", metavar="PORT",
                         help="merge Front STM CLI FRONT? data, e.g. COM11")
@@ -1269,13 +1837,25 @@ def main() -> int:
     parser.add_argument("--bms-serial", metavar="PORT",
                         help="merge read-only DALY R24TS telemetry, e.g. COM5")
     parser.add_argument("--bms-baud", type=int, default=9600)
+    parser.add_argument("--database", default=str(PROJECT_ROOT / "data" / "ev_telemetry.db"),
+                        help="SQLite database used by dashboard measurement sessions")
     args = parser.parse_args()
+    if args.rear_serial and args.enable_control:
+        parser.error("Rear ST-Link USB input is read-only; --enable-control is not allowed")
+    if args.rear_serial and args.rear_serial.upper() in {
+            (args.front_serial or '').upper(), (args.bms_serial or '').upper()}:
+        parser.error("Rear, Front and BMS must use different serial ports")
 
-    relay_token = os.environ.get(args.relay_token_env, "")
+    relay_token = "" if args.rear_serial else os.environ.get(args.relay_token_env, "")
     gateway = EVGateway(args.listen_host, args.listen_port, args.pit_host, args.pit_port,
                         enable_control=args.enable_control, command_port=args.esp_command_port,
-                        relay_token=relay_token)
-    if args.serial:
+                        relay_token=relay_token, database_path=args.database)
+    if args.rear_serial:
+        gateway.input_mode, gateway.input_port = "STM_USB", args.rear_serial
+        source = lambda: gateway.rear_serial_loop(args.rear_serial, args.baud)
+        mode = f"REAR STM USB {args.rear_serial} @ {args.baud} (READ ONLY, wireless disabled)"
+    elif args.serial:
+        gateway.input_mode, gateway.input_port = "ESP_USB", args.serial
         source = lambda: gateway.serial_loop(args.serial, args.baud)
         mode = f"SERIAL {args.serial} @ {args.baud}"
     else:
@@ -1314,6 +1894,7 @@ def main() -> int:
     print(f"Pit dashboard forward: {args.pit_host}:{args.pit_port}")
     print(f"Front direct: {args.front_serial or 'DISABLED'}")
     print(f"BMS direct: {args.bms_serial or 'ESP / WIRELESS'} @ {args.bms_baud}")
+    print(f"Telemetry database: {Path(args.database).resolve()}")
     print(f"Pit control: {'ENABLED' if args.enable_control else 'READ ONLY'} on UDP {args.command_listen_host}:{args.command_listen_port}")
     print(f"Vehicle HTTPS relay: {'ENABLED' if relay_token else 'DISABLED'} at /api/vehicle/exchange")
     try:
@@ -1324,6 +1905,8 @@ def main() -> int:
         gateway.stop_event.set()
         server.server_close()
         gateway.forward_socket.close()
+        if gateway.database is not None:
+            gateway.database.close()
     return 0
 
 

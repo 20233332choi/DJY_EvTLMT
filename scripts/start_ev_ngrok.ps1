@@ -21,7 +21,7 @@ try {
     $existing = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 2
     $evTunnel = $existing.tunnels | Where-Object {
         $_.config.addr -match '(:|localhost)8766$' -and
-        (-not $requestedScheme -or $_.public_url -like "${requestedScheme}://*")
+        (-not $PublicUrl -or $_.public_url.TrimEnd('/') -eq $PublicUrl.TrimEnd('/'))
     } | Select-Object -First 1
     if ($evTunnel) {
         Write-Host "Vehicle exchange: $($evTunnel.public_url)/api/vehicle/exchange"
@@ -41,12 +41,32 @@ try {
 
 $ngrokArgs = @('http', '8766')
 if ($PublicUrl) { $ngrokArgs += @('--url', $PublicUrl) }
-Start-Process -FilePath $ngrok.Source -ArgumentList $ngrokArgs -WindowStyle Hidden
-Start-Sleep -Seconds 3
-$tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 3
-$public = $tunnels.tunnels | Where-Object {
-    $_.config.addr -match '(:|localhost)8766$' -and
-    (-not $requestedScheme -or $_.public_url -like "${requestedScheme}://*")
-} | Select-Object -First 1
+$proxyNames = @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'GIT_HTTP_PROXY', 'GIT_HTTPS_PROXY')
+$savedProxy = @{}
+foreach ($name in $proxyNames) {
+    $savedProxy[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
+try {
+    Start-Process -FilePath $ngrok.Source -ArgumentList $ngrokArgs -WindowStyle Hidden
+} finally {
+    foreach ($name in $proxyNames) {
+        [Environment]::SetEnvironmentVariable($name, $savedProxy[$name], 'Process')
+    }
+}
+$public = $null
+for ($attempt = 0; $attempt -lt 30 -and -not $public; $attempt++) {
+    Start-Sleep -Milliseconds 500
+    foreach ($apiPort in 4040,4041,4042) {
+        try {
+            $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:$apiPort/api/tunnels" -TimeoutSec 1
+            $public = $tunnels.tunnels | Where-Object {
+                $_.config.addr -match '(:|localhost)8766$' -and
+                (-not $PublicUrl -or $_.public_url.TrimEnd('/') -eq $PublicUrl.TrimEnd('/'))
+            } | Select-Object -First 1
+            if ($public) { break }
+        } catch {}
+    }
+}
 if (-not $public) { throw "ngrok started, but no requested tunnel for port 8766 was found." }
 Write-Host "Vehicle exchange: $($public.public_url)/api/vehicle/exchange"

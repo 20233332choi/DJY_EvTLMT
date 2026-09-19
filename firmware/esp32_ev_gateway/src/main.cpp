@@ -5,10 +5,23 @@
 #include <WiFiUdp.h>
 #include <esp32-hal-rgb-led.h>
 #include <driver/twai.h>
+#include <lwip/sockets.h>
+#include <time.h>
+#include <esp_system.h>
 
 #include "config.h"
 #include "djy_can_protocol.h"
 #include "djy_uart_protocol.h"
+#include "letsencrypt_gen_y.h"
+#include "rear_uart_line.h"
+#include "rear_timing.h"
+#include "telemetry_queue.h"
+#if EV_RELAY_FAST_RSA_TLS
+#include "ngrok_tls_client.h"
+#endif
+#if EV_TLS_DIAGNOSTICS_ONCE
+#include "relay_tls_diagnostics.h"
+#endif
 
 #ifndef EV_REAR_UART_MODE
 #define EV_REAR_UART_MODE 0
@@ -22,8 +35,28 @@
 #define EV_REAR_UART_TX_GPIO 17
 #endif
 
+#ifndef EV_BMS_CAN_ENABLED
+#define EV_BMS_CAN_ENABLED 0
+#endif
+
+#ifndef EV_BMS_CAN_TX_GPIO
+#define EV_BMS_CAN_TX_GPIO 9
+#endif
+
+#ifndef EV_BMS_CAN_RX_GPIO
+#define EV_BMS_CAN_RX_GPIO 8
+#endif
+
+#if EV_BMS_CAN_ENABLED && !EV_REAR_UART_MODE
+#error "DALY BMS CAN shares the ESP TWAI controller; enable it only in Rear UART mode"
+#endif
+
 #ifndef EV_LOCAL_UDP_ENABLED
 #define EV_LOCAL_UDP_ENABLED 1
+#endif
+
+#ifndef EV_RECEIVE_ONLY
+#define EV_RECEIVE_ONLY 0
 #endif
 
 #ifndef EV_RELAY_ENABLED
@@ -78,20 +111,33 @@
 
 namespace {
 
-WiFiUDP telemetryUdp;
+int telemetrySocket = -1;
 WiFiUDP commandUdp;
 IPAddress pitHost;
 bool canReady = false;
+bool bmsCanReady = false;
 HardwareSerial rearUart(1);
 bool rearUartReady = false;
+uint32_t wifiLastReconnectMs = 0;
+uint32_t wifiReconnectAttempts = 0;
 constexpr uint16_t kSasCounts = 16384u;
 constexpr uint16_t kSasCenterRaw = 8192u;
 constexpr float kSasToSteeringRatio = -0.2f;
+constexpr size_t kTelemetryJsonSize = 4096u;
 
 struct VehicleState {
+    RearTiming timing;
+    bool sasValid = false;
+    uint16_t sasCenterRaw = 8192;
+    float steeringRad = 0.0f;
     uint32_t sequence = 0;
     uint16_t sasRaw = 0, tpsRaw = 0;
     uint16_t rpmLeft = 0, rpmRight = 0;
+    uint32_t captureLeft = 0, captureRight = 0;
+    uint32_t glitchLeft = 0, glitchRight = 0;
+    uint32_t desyncLeft = 0, desyncRight = 0;
+    uint32_t stmCanRx = 0, stmCanErrors = 0, stmCanStatus = 0;
+    uint32_t stmImuDiag0 = 0, stmImuDiag1 = 0, stmImuDiag2 = 0, stmImuDiag3 = 0;
     uint16_t dacLeft = 0, dacRight = 0;
     uint8_t tvRequested = 0, regenRequested = 0;
     uint8_t tvApplied = 0, regenApplied = 0;
@@ -101,10 +147,38 @@ struct VehicleState {
     uint16_t tvRamp = 200, regenRamp = 0;
     bool configAck = false;
     bool imuValid = false;
-    uint32_t rearUartRx = 0, rearUartErrors = 0;
+    float yawRateRadS = 0.0f, lateralAccelMS2 = 0.0f, longitudinalAccelMS2 = 0.0f;
+    float imuRawAx = 0.0f, imuRawAy = 0.0f, imuRawAz = 0.0f;
+    float vehicleSpeedMS = 0.0f, desiredYawRadS = 0.0f, yawErrorRadS = 0.0f;
+    float deltaPowerKw = 0.0f, powerLeftKw = 0.0f, powerRightKw = 0.0f;
+    float tractionScale = 1.0f;
+    float pidKp = 0.0f, pidKi = 0.0f, pidKd = 0.0f;
+    uint32_t pidMs = 0;
+    bool edActive = false;
+    uint32_t rearUartRx = 0, rearUartErrors = 0, rearUartBytes = 0;
+    uint32_t rearRxHigh = 0, rearRxLow = 0;
+    bool rpmLeftValid = false, rpmRightValid = false;
+    uint32_t rearCommandRx = 0, rearCommandErrors = 0, rearExtendedMs = 0, tqvInternalMs = 0;
     int16_t tpsReportedPct = -1;
     uint32_t sasMs = 0, tpsMs = 0, driverMs = 0, rearMs = 0;
 } state;
+
+struct BmsState {
+    float voltage = 0.0f, current = 0.0f, soc = 0.0f;
+    float maxCell = 0.0f, minCell = 0.0f, maxTemp = 0.0f, minTemp = 0.0f;
+    float remainingAh = 0.0f;
+    uint16_t maxCellNumber = 0, minCellNumber = 0, cycleCount = 0;
+    uint8_t cellCount = 0, tempCount = 0, life = 0;
+    uint8_t state = 0;
+    bool chargeMos = false, dischargeMos = false, charger = false, load = false, balancing = false;
+    uint8_t alarm[8] = {};
+    float cells[48] = {};
+    bool cellSeen[48] = {};
+    uint32_t lastRxMs = 0;
+} bms;
+
+uint8_t bmsRequestId = 0x90;
+uint32_t bmsNextRequestMs = 0;
 
 DjyUartLiveTv liveCommand = {};
 bool liveCommandSeen = false;
@@ -124,11 +198,15 @@ bool jsonStringEquals(const String& input, const char* key, const char* expected
 
 #if EV_RELAY_ENABLED
 portMUX_TYPE relayMux = portMUX_INITIALIZER_UNLOCKED;
-char relayTelemetry[1536] = {};
-uint32_t relayTelemetryVersion = 0;
+TelemetryQueue<kTelemetryJsonSize, 16> relaySamples;
+char relayStreamId[17] = {};
+constexpr size_t kRelayBatchSize = 4 * kTelemetryJsonSize + 512;
+// Task-owned static buffer avoids a 17 KB stack allocation.
+char relayBatch[kRelayBatchSize] = {};
 char relayCommand[512] = {};
 bool relayCommandPending = false;
 uint32_t relayTxCount = 0;
+uint32_t relayLastSuccessMs = 0;
 uint32_t relayErrorCount = 0;
 uint32_t relayCommandCount = 0;
 int relayLastHttpStatus = 0;
@@ -138,8 +216,7 @@ int relayTlsError = 0;
 
 void stageRelayTelemetry(const char* json) {
     portENTER_CRITICAL(&relayMux);
-    strlcpy(relayTelemetry, json, sizeof(relayTelemetry));
-    ++relayTelemetryVersion;
+    relaySamples.push(state.sequence, json);
     portEXIT_CRITICAL(&relayMux);
 }
 
@@ -159,7 +236,12 @@ void stageRelayCommand(const String& response) {
 }
 
 void relayTask(void*) {
-    const String relayUrl(EV_RELAY_URL);
+    String relayUrl(EV_RELAY_URL);
+    /* Prefer TLS even for telemetry. Existing configs may still contain an
+     * http:// ngrok URL from the original read-only implementation. */
+    if (relayUrl.startsWith("http://") && !EV_ALLOW_PLAINTEXT_RELAY) {
+        relayUrl = String("https://") + relayUrl.substring(7);
+    }
     const String relayToken(EV_RELAY_TOKEN);
     const bool relayUsesTls = relayUrl.startsWith("https://");
     const bool relayUsesPlaintext = relayUrl.startsWith("http://");
@@ -185,21 +267,76 @@ void relayTask(void*) {
         relayAuthority = relayAuthority.substring(0, portMarker);
     }
 
-    uint32_t sentVersion = 0;
+    snprintf(relayStreamId, sizeof(relayStreamId), "%08lx%08lx",
+             static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
     uint32_t retryMs = 1000;
     bool networkPathChecked = false;
+    bool networkTimeRequested = false;
+#if EV_TLS_DIAGNOSTICS_ONCE
+    bool tlsProbed = false;
+#endif
+    // Keep the authenticated TLS socket alive across telemetry exchanges.
+    WiFiClient plainClient;
+#if EV_RELAY_FAST_RSA_TLS
+    NgrokTlsClient secureClient;
+#else
+    WiFiClientSecure secureClient;
+#endif
+    static const char* relayAlpn[] = {"http/1.1", nullptr};
+    secureClient.setAlpnProtocols(relayAlpn);
+    WiFiClient* relayClient = relayUsesTls ? static_cast<WiFiClient*>(&secureClient) : &plainClient;
+#if defined(EV_RELAY_CA_CERT)
+    secureClient.setCACert(EV_RELAY_CA_CERT);
+#elif EV_RELAY_ALLOW_INSECURE_TLS
+    secureClient.setInsecure();
+#else
+    secureClient.setCACert(kLetsEncryptGenYRoots);
+#endif
+    secureClient.setHandshakeTimeout(5);
+    HTTPClient http;
+    http.useHTTP10(false);
+    http.setReuse(true);
+    http.setConnectTimeout(5000);
+    http.setTimeout(2500);
     for (;;) {
         if (WiFi.status() != WL_CONNECTED) {
+            relayClient->stop();
             networkPathChecked = false;
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
+        /* X.509 validation is meaningless while the ESP still thinks it is
+         * 1970. NTP runs in the networking stack; only this low-priority relay
+         * task waits, while UART and vehicle telemetry continue normally. */
+        if (relayUsesTls && time(nullptr) < 1700000000) {
+            if (!networkTimeRequested) {
+                configTime(0, 0, "pool.ntp.org", "time.google.com");
+                networkTimeRequested = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+#if EV_TLS_DIAGNOSTICS_ONCE
+        if (!tlsProbed) {
+            // Delay permits a serial observer to attach after an upload reset.
+            vTaskDelay(pdMS_TO_TICKS(8000));
+            for (unsigned profile = 3; profile < 5; ++profile) {
+                RelayTlsProbe probe;
+                probe.run(relayAuthority.c_str(), relayPort, kLetsEncryptGenYRoots, profile);
+            }
+            tlsProbed = true;
+        }
+#endif
         if (!networkPathChecked) {
             IPAddress relayAddress;
             const int dnsOk = WiFi.hostByName(relayAuthority.c_str(), relayAddress) == 1 ? 1 : -1;
             int tcpOk = 0;
             if (dnsOk == 1) {
+                Serial.printf("# Relay resolved=%s epoch=%ld free_heap=%u\n",
+                              relayAddress.toString().c_str(), static_cast<long>(time(nullptr)),
+                              static_cast<unsigned>(ESP.getFreeHeap()));
                 WiFiClient tcpProbe;
                 tcpOk = tcpProbe.connect(relayAddress, relayPort, 5000) == 1 ? 1 : -1;
                 tcpProbe.stop();
@@ -211,51 +348,29 @@ void relayTask(void*) {
             networkPathChecked = true;
         }
 
-        char payload[1536];
-        uint32_t pendingVersion = 0;
+        uint32_t lastSequence = 0;
+        uint32_t droppedSamples = 0;
+        size_t queuedSamples = 0;
         portENTER_CRITICAL(&relayMux);
-        pendingVersion = relayTelemetryVersion;
-        strlcpy(payload, relayTelemetry, sizeof(payload));
+        droppedSamples = relaySamples.dropped();
+        const int prefix = snprintf(relayBatch, sizeof(relayBatch),
+            "{\"stream_id\":\"%s\",\"sent_ms\":%lu,\"dropped_samples\":%lu,\"samples\":",
+            relayStreamId, static_cast<unsigned long>(millis()), static_cast<unsigned long>(droppedSamples));
+        queuedSamples = relaySamples.batch(relayBatch + prefix, sizeof(relayBatch) - prefix - 1, 4, lastSequence);
         portEXIT_CRITICAL(&relayMux);
-        if (pendingVersion == 0u || pendingVersion == sentVersion || payload[0] == '\0') {
+        if (queuedSamples == 0) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        strlcat(relayBatch, "}", sizeof(relayBatch));
 
-        // Baja relay compatibility: one DNS/TCP/TLS/HTTP exchange per socket.
-        // ngrok can acknowledge keep-alive while delaying a reused TLS socket.
-        WiFiClient plainClient;
-        WiFiClientSecure secureClient;
-        WiFiClient* relayClient = relayUsesTls ? static_cast<WiFiClient*>(&secureClient) : &plainClient;
-        if (relayUsesTls) {
-#if defined(EV_RELAY_CA_CERT)
-            secureClient.setCACert(EV_RELAY_CA_CERT);
-#elif EV_RELAY_ALLOW_INSECURE_TLS
-            secureClient.setInsecure();
-#else
-            Serial.println("# HTTPS relay disabled: configure EV_RELAY_CA_CERT");
-            vTaskDelete(nullptr);
-            return;
-#endif
-            // Keep failed cellular/ngrok handshakes bounded.  The relay task
-            // runs at idle priority below so a slow TLS peer cannot starve
-            // the ESP-IDF idle task and trip the core watchdog.
-            secureClient.setHandshakeTimeout(7);
-        }
-
-        HTTPClient http;
-        http.useHTTP10(true);
-        http.setReuse(false);
-        http.setConnectTimeout(7000);
-        http.setTimeout(7000);
         bool success = false;
         if (http.begin(*relayClient, relayUrl)) {
             http.addHeader("Content-Type", "application/json");
             http.addHeader("Authorization", String("Bearer ") + relayToken);
             http.addHeader("X-Vehicle-ID", EV_VEHICLE_ID);
             http.addHeader("ngrok-skip-browser-warning", "1");
-            http.addHeader("Connection", "close");
-            const int status = http.POST(reinterpret_cast<uint8_t*>(payload), strlen(payload));
+            const int status = http.POST(reinterpret_cast<uint8_t*>(relayBatch), strlen(relayBatch));
             char tlsErrorText[96] = {};
             const int tlsError = relayUsesTls && status < 0
                                      ? secureClient.lastError(tlsErrorText, sizeof(tlsErrorText))
@@ -266,13 +381,19 @@ void relayTask(void*) {
             portEXIT_CRITICAL(&relayMux);
             if (status >= 200 && status < 300) {
                 const String response = http.getString();
-                stageRelayCommand(response);
-                sentVersion = pendingVersion;
-                portENTER_CRITICAL(&relayMux);
-                ++relayTxCount;
-                portEXIT_CRITICAL(&relayMux);
-                retryMs = 1000;
-                success = true;
+                const int ackStart = response.indexOf("\"ack_seq\"");
+                const int ackColon = ackStart >= 0 ? response.indexOf(':', ackStart) : -1;
+                const uint32_t ack = ackColon >= 0 ? strtoul(response.c_str() + ackColon + 1, nullptr, 10) : 0;
+                if (ack == lastSequence) {
+                    stageRelayCommand(response);
+                    portENTER_CRITICAL(&relayMux);
+                    relaySamples.acknowledge(ack);
+                    ++relayTxCount;
+                    relayLastSuccessMs = millis();
+                    portEXIT_CRITICAL(&relayMux);
+                    retryMs = 1000;
+                    success = true;
+                }
             }
             http.end();
         } else {
@@ -280,16 +401,15 @@ void relayTask(void*) {
             relayLastHttpStatus = -1000;
             portEXIT_CRITICAL(&relayMux);
         }
-        relayClient->stop();
         if (!success) {
+            relayClient->stop();
             portENTER_CRITICAL(&relayMux);
             ++relayErrorCount;
             portEXIT_CRITICAL(&relayMux);
             vTaskDelay(pdMS_TO_TICKS(retryMs));
-            retryMs = min(retryMs * 2u, 5000u);
+            retryMs = min<uint32_t>(retryMs * 2u, 5000u);
         } else {
-            // A fresh TCP connection per exchange is ngrok-compatible, but
-            // cap it near 4 Hz to avoid exhausting free-tunnel connection rate.
+            // Bound request rate; keep-alive saves TLS work, not HTTP quota.
             vTaskDelay(pdMS_TO_TICKS(250));
         }
     }
@@ -318,6 +438,26 @@ void runStatusLedSelfTest() {
 #endif
 }
 
+void maintainWifi() {
+    static uint32_t lastReport = 0;
+    const uint32_t reportNow = millis();
+    if (reportNow - lastReport >= 2000u) {
+        lastReport = reportNow;
+        Serial.printf("# WiFi status=%d ip=%s rssi=%ld reconnects=%lu\n",
+                      static_cast<int>(WiFi.status()), WiFi.localIP().toString().c_str(),
+                      WiFi.status() == WL_CONNECTED ? static_cast<long>(WiFi.RSSI()) : -127L,
+                      static_cast<unsigned long>(wifiReconnectAttempts));
+    }
+    if (WiFi.status() == WL_CONNECTED) return;
+    const uint32_t now = millis();
+    if (now - wifiLastReconnectMs < 15000u) return;
+    wifiLastReconnectMs = now;
+    ++wifiReconnectAttempts;
+    if (!WiFi.reconnect()) {
+        WiFi.begin(EV_WIFI_SSID, EV_WIFI_PASSWORD);
+    }
+}
+
 void updateStatusLed() {
 #if EV_STATUS_LED_ENABLED
     const uint32_t now = millis();
@@ -332,11 +472,12 @@ void updateStatusLed() {
     }
 
 #if EV_RELAY_ENABLED
-    uint32_t relayTx = 0;
+    uint32_t relayTx = 0, relaySuccessMs = 0;
     portENTER_CRITICAL(&relayMux);
     relayTx = relayTxCount;
+    relaySuccessMs = relayLastSuccessMs;
     portEXIT_CRITICAL(&relayMux);
-    if (relayTx > 0u) {
+    if (relayTx > 0u && now - relaySuccessMs < 5000u) {
         setStatusLed(0, 64, 0);  // Green: live HTTPS telemetry upload.
     } else {
         setStatusLed(blink ? 64 : 0, blink ? 32 : 0, 0);  // Yellow: relay retrying.
@@ -369,7 +510,11 @@ float sasRelativeDeg() {
 }
 
 float speedKmh() {
+    // Rear already applies its current gear ratio and wheel calibration.
+    if (EV_REAR_UART_MODE) return state.vehicleSpeedMS * 3.6f;
     constexpr float kGearRatio = 3.8f, kTireRadiusM = 0.2286f;
+    // A single noisy/missing wheel must never become vehicle speed.
+    if ((state.rpmLeft == 0u) != (state.rpmRight == 0u)) return 0.0f;
     const float motorRpm = 0.5f * (state.rpmLeft + state.rpmRight);
     return motorRpm / kGearRatio * (2.0f * PI * kTireRadiusM) / 60.0f * 3.6f;
 }
@@ -408,6 +553,74 @@ int jsonInteger(const String& input, const char* key, int fallback) {
     start += marker.length();
     while (start < input.length() && input[start] == ' ') ++start;
     return input.substring(start).toInt();
+}
+
+uint16_t bmsU16(const uint8_t* data, uint8_t offset) {
+    return static_cast<uint16_t>((static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1]);
+}
+
+uint32_t bmsU32(const uint8_t* data, uint8_t offset) {
+    return (static_cast<uint32_t>(data[offset]) << 24) |
+           (static_cast<uint32_t>(data[offset + 1]) << 16) |
+           (static_cast<uint32_t>(data[offset + 2]) << 8) | data[offset + 3];
+}
+
+void receiveBmsCan() {
+#if EV_BMS_CAN_ENABLED
+    twai_message_t frame = {};
+    while (twai_receive(&frame, 0) == ESP_OK) {
+        if (!frame.extd || frame.rtr || frame.data_length_code != 8) continue;
+        const uint8_t id = static_cast<uint8_t>((frame.identifier >> 16) & 0xffu);
+        if (id < 0x90 || id > 0x98 ||
+            frame.identifier != (0x18000000u | (static_cast<uint32_t>(id) << 16) | 0x4001u)) continue;
+        const uint8_t* d = frame.data;
+        bms.lastRxMs = millis();
+        if (id == 0x90) {
+            bms.voltage = bmsU16(d, 0) / 10.0f;
+            bms.current = (static_cast<int32_t>(bmsU16(d, 4)) - 30000) / 10.0f;
+            bms.soc = bmsU16(d, 6) / 10.0f;
+        } else if (id == 0x91) {
+            bms.maxCell = bmsU16(d, 0) / 1000.0f; bms.maxCellNumber = d[2];
+            bms.minCell = bmsU16(d, 3) / 1000.0f; bms.minCellNumber = d[5];
+        } else if (id == 0x92) {
+            bms.maxTemp = static_cast<float>(d[0]) - 40.0f;
+            bms.minTemp = static_cast<float>(d[2]) - 40.0f;
+        } else if (id == 0x93) {
+            bms.state = d[0]; bms.chargeMos = d[1] != 0; bms.dischargeMos = d[2] != 0;
+            bms.life = d[3]; bms.remainingAh = bmsU32(d, 4) / 1000.0f;
+        } else if (id == 0x94) {
+            bms.cellCount = d[0] > 48 ? 48 : d[0]; bms.tempCount = d[1] > 16 ? 16 : d[1];
+            bms.charger = d[2] != 0; bms.load = d[3] != 0; bms.cycleCount = bmsU16(d, 6);
+        } else if (id == 0x95) {
+            if (d[0] != 0) {
+                const uint8_t firstCell = static_cast<uint8_t>((d[0] - 1u) * 3u);
+                for (uint8_t i = 0; i < 3 && firstCell + i < 48; ++i) {
+                    const uint8_t cell = static_cast<uint8_t>(firstCell + i);
+                    bms.cells[cell] = bmsU16(d, static_cast<uint8_t>(1u + i * 2u)) / 1000.0f;
+                    bms.cellSeen[cell] = bms.cells[cell] > 0.0f;
+                }
+            }
+        } else if (id == 0x97) {
+            bms.balancing = false;
+            for (uint8_t i = 0; i < 8; ++i) bms.balancing = bms.balancing || d[i] != 0;
+        } else if (id == 0x98) {
+            memcpy(bms.alarm, d, sizeof(bms.alarm));
+        }
+    }
+    const uint32_t now = millis();
+    if (bmsCanReady && static_cast<int32_t>(now - bmsNextRequestMs) >= 0) {
+        twai_message_t request = {};
+        request.identifier = 0x18000000u | (static_cast<uint32_t>(bmsRequestId) << 16) | 0x0140u;
+        request.extd = 1;
+        request.data_length_code = 8;
+        if (twai_transmit(&request, 0) == ESP_OK) {
+            bmsRequestId = bmsRequestId == 0x98 ? 0x90 : static_cast<uint8_t>(bmsRequestId + 1u);
+            bmsNextRequestMs = now + 100u;
+        } else {
+            bmsNextRequestMs = now + 20u;
+        }
+    }
+#endif
 }
 
 bool jsonBoolean(const String& input, const char* key, bool fallback) {
@@ -455,32 +668,55 @@ void receiveCan() {
     }
 }
 
-void parseRearUartLine(const char* line) {
+bool parseRearUartLine(const char* line) {
     unsigned rpmLeft = 0, rpmRight = 0, tpsRaw = 0, idleRaw = 0;
     unsigned espFresh = 0, espSequence = 0;
+    unsigned imuValid = 0, sasRaw = 0;
+    long yawMilli = 0, latMilli = 0, lonMilli = 0;
+    long axMilli = 0, ayMilli = 0, azMilli = 0;
     unsigned long captureLeft = 0, captureRight = 0;
     unsigned long glitchLeft = 0, glitchRight = 0, espRxCount = 0;
     int tpsPct = 0;
-    const int fields = sscanf(
+    const int headFields = sscanf(
         line,
-        "L=%u R=%u cap=%lu/%lu glt=%lu/%lu tps=%u pct=%d idle=%u esp=%u/%u rx=%lu",
-        &rpmLeft, &rpmRight, &captureLeft, &captureRight, &glitchLeft, &glitchRight,
-        &tpsRaw, &tpsPct, &idleRaw, &espFresh, &espSequence, &espRxCount);
-    // Older installed Rear firmware ends after idle=<raw> (9 fields).
-    // Newer builds append esp=<fresh>/<seq> rx=<count> (12 fields).
-    if (fields < 9) return;
+        "L=%u R=%u cap=%lu/%lu glt=%lu/%lu",
+        &rpmLeft, &rpmRight, &captureLeft, &captureRight, &glitchLeft, &glitchRight);
+    // Team firmware can insert diagnostic fields between glt and tps. Locate
+    // the stable TPS marker instead of requiring one monolithic sentence.
+    const char* tps = strstr(line, " tps=");
+    const int tpsFields = tps == nullptr ? 0 :
+        sscanf(tps, " tps=%u pct=%d idle=%u", &tpsRaw, &tpsPct, &idleRaw);
+    const char* esp = strstr(line, " esp=");
+    if (esp != nullptr) {
+        (void)sscanf(esp, " esp=%u/%u rx=%lu", &espFresh, &espSequence, &espRxCount);
+    }
+    if (headFields != 6 || tpsFields != 3 || rpmLeft > 65535u || rpmRight > 65535u ||
+        tpsRaw > 4095u || idleRaw > 4095u || tpsPct < 0 || tpsPct > 100) return false;
+    state.timing.parse(line); // Missing/malformed extension clears previous timing.
 
-    (void)captureLeft;
-    (void)captureRight;
-    (void)glitchLeft;
-    (void)glitchRight;
+    unsigned validLeft = 0, validRight = 0;
+    const char* validity = strstr(line, " rv=");
+    if (validity != nullptr && (sscanf(validity, " rv=%u/%u", &validLeft, &validRight) != 2 ||
+                               validLeft > 1u || validRight > 1u)) return false;
+    // Missing validity is unverified, not a valid stationary measurement.
+    state.rpmLeftValid = validity != nullptr && validLeft == 1u;
+    state.rpmRightValid = validity != nullptr && validRight == 1u;
+
+    // A stopped motor can leave an un-driven capture input floating. If almost
+    // every capture was rejected as a glitch, never present that RPM as real.
+    const bool leftSignalInvalid = glitchLeft > captureLeft + 100u;
+    const bool rightSignalInvalid = glitchRight > captureRight + 100u;
     (void)idleRaw;
     (void)espFresh;
     (void)espSequence;
     (void)espRxCount;
 
-    state.rpmLeft = static_cast<uint16_t>(constrain(rpmLeft, 0u, 65535u));
-    state.rpmRight = static_cast<uint16_t>(constrain(rpmRight, 0u, 65535u));
+    state.rpmLeft = leftSignalInvalid ? 0u : static_cast<uint16_t>(constrain(rpmLeft, 0u, 65535u));
+    state.rpmRight = rightSignalInvalid ? 0u : static_cast<uint16_t>(constrain(rpmRight, 0u, 65535u));
+    state.captureLeft = static_cast<uint32_t>(captureLeft);
+    state.captureRight = static_cast<uint32_t>(captureRight);
+    state.glitchLeft = static_cast<uint32_t>(glitchLeft);
+    state.glitchRight = static_cast<uint32_t>(glitchRight);
     state.tpsRaw = static_cast<uint16_t>(constrain(tpsRaw, 0u, 65535u));
     state.tpsReportedPct = static_cast<int16_t>(constrain(tpsPct, 0, 100));
     state.rearSequence++;
@@ -488,9 +724,113 @@ void parseRearUartLine(const char* line) {
     state.tpsMs = now;
     state.rearMs = now;
 
+    unsigned long diag0 = 0, diag1 = 0, diag2 = 0, diag3 = 0;
+    const char* desync = strstr(line, " dsy=");
+    if (desync != nullptr && sscanf(desync, " dsy=%lu/%lu", &diag0, &diag1) == 2) {
+        state.desyncLeft = static_cast<uint32_t>(diag0);
+        state.desyncRight = static_cast<uint32_t>(diag1);
+    }
+    const char* canDiag = strstr(line, " can=");
+    if (canDiag != nullptr && sscanf(canDiag, " can=%lu/%lu/%lx", &diag0, &diag1, &diag2) == 3) {
+        state.stmCanRx = static_cast<uint32_t>(diag0);
+        state.stmCanErrors = static_cast<uint32_t>(diag1);
+        state.stmCanStatus = static_cast<uint32_t>(diag2);
+    }
+
+    const char* sensor = strstr(line, " imu=");
+    const int sensorFields = sensor == nullptr ? 0 :
+        sscanf(sensor, " imu=%u sas=%u yaw=%ld lat=%ld lon=%ld ax=%ld ay=%ld az=%ld",
+               &imuValid, &sasRaw, &yawMilli, &latMilli, &lonMilli,
+               &axMilli, &ayMilli, &azMilli);
+    if (sensor != nullptr && sensorFields >= 4 &&
+        imuValid <= 1u && sasRaw <= 16383u) {
+        state.imuValid = imuValid != 0u;
+        state.sasRaw = static_cast<uint16_t>(sasRaw);
+        state.yawRateRadS = static_cast<float>(yawMilli) / 1000.0f;
+        state.lateralAccelMS2 = static_cast<float>(latMilli) / 1000.0f;
+        state.longitudinalAccelMS2 = static_cast<float>(lonMilli) / 1000.0f;
+        state.imuRawAx = static_cast<float>(axMilli) / 1000.0f;
+        state.imuRawAy = static_cast<float>(ayMilli) / 1000.0f;
+        state.imuRawAz = static_cast<float>(azMilli) / 1000.0f;
+        state.sasMs = now;
+    } else {
+        state.imuValid = false;
+        state.sasMs = 0;
+        state.yawRateRadS = 0.0f;
+        state.lateralAccelMS2 = 0.0f;
+        state.longitudinalAccelMS2 = 0.0f;
+        state.imuRawAx = 0.0f;
+        state.imuRawAy = 0.0f;
+        state.imuRawAz = 0.0f;
+    }
+    if (sensor != nullptr && sscanf(sensor, " imu=%lu/%lu/%lu/%lu",
+                                   &diag0, &diag1, &diag2, &diag3) == 4) {
+        state.stmImuDiag0 = static_cast<uint32_t>(diag0);
+        state.stmImuDiag1 = static_cast<uint32_t>(diag1);
+        state.stmImuDiag2 = static_cast<uint32_t>(diag2);
+        state.stmImuDiag3 = static_cast<uint32_t>(diag3);
+    }
+    const char* imuDiag = strstr(line, " idg=");
+    if (imuDiag != nullptr && sscanf(imuDiag, " idg=%lu/%lu/%lu/%lu", &diag0, &diag1, &diag2, &diag3) == 4) {
+        state.stmImuDiag0 = static_cast<uint32_t>(diag0);
+        state.stmImuDiag1 = static_cast<uint32_t>(diag1);
+        state.stmImuDiag2 = static_cast<uint32_t>(diag2);
+        state.stmImuDiag3 = static_cast<uint32_t>(diag3);
+    }
+
+    long vehicleSpeedMilli = 0, desiredYawMilli = 0, yawErrorMilli = 0;
+    long deltaPowerMilli = 0, powerLeftMilli = 0, powerRightMilli = 0, tractionMilli = 1000;
+    unsigned tqvActive = 0, tqvEdActive = 0;
+    const char* tqv = strstr(line, " vs=");
+    const bool tqvExtended = tqv != nullptr && sscanf(
+        tqv,
+        " vs=%ld dy=%ld ye=%ld dp=%ld pl=%ld pr=%ld tva=%u eda=%u tr=%ld",
+        &vehicleSpeedMilli, &desiredYawMilli, &yawErrorMilli, &deltaPowerMilli,
+        &powerLeftMilli, &powerRightMilli, &tqvActive, &tqvEdActive, &tractionMilli) == 9 &&
+        tqvActive <= 1u && tqvEdActive <= 1u && tractionMilli >= 0 && tractionMilli <= 1000;
+    if (tqvExtended) {
+        state.vehicleSpeedMS = static_cast<float>(vehicleSpeedMilli) / 1000.0f;
+        state.desiredYawRadS = static_cast<float>(desiredYawMilli) / 1000.0f;
+        state.yawErrorRadS = static_cast<float>(yawErrorMilli) / 1000.0f;
+        state.deltaPowerKw = static_cast<float>(deltaPowerMilli) / 1000.0f;
+        state.powerLeftKw = static_cast<float>(powerLeftMilli) / 1000.0f;
+        state.powerRightKw = static_cast<float>(powerRightMilli) / 1000.0f;
+        state.tractionScale = static_cast<float>(tractionMilli) / 1000.0f;
+        state.edActive = tqvEdActive != 0u;
+        if (tqvActive) state.rearFlags |= DJY_REAR_STATUS_TV_ACTIVE;
+        else state.rearFlags &= static_cast<uint8_t>(~DJY_REAR_STATUS_TV_ACTIVE);
+        if (state.edActive) state.rearFlags |= DJY_REAR_STATUS_ED_ACTIVE;
+        else state.rearFlags &= static_cast<uint8_t>(~DJY_REAR_STATUS_ED_ACTIVE);
+        state.rearExtendedMs = now;
+        state.tqvInternalMs = now;
+    } else {
+        // A legacy/team sentence without these fields is an explicit
+        // "not received" sample, not a new sample containing zeroes.
+        state.vehicleSpeedMS = 0.0f;
+        state.desiredYawRadS = 0.0f;
+        state.yawErrorRadS = 0.0f;
+        state.deltaPowerKw = 0.0f;
+        state.powerLeftKw = 0.0f;
+        state.powerRightKw = 0.0f;
+        state.tractionScale = 1.0f;
+        state.edActive = false;
+        state.tqvInternalMs = 0u;
+    }
+
+    long kp = 0, ki = 0, kd = 0;
+    const char* pid = strstr(line, " kp=");
+    state.pidMs = 0;
+    if (pid != nullptr && sscanf(pid, " kp=%ld ki=%ld kd=%ld", &kp, &ki, &kd) == 3 &&
+        kp >= 0 && ki >= 0 && kd >= 0) {
+        state.pidKp = kp / 1000.0f;
+        state.pidKi = ki / 1000.0f;
+        state.pidKd = kd / 1000.0f;
+        state.pidMs = now;
+    }
+
     unsigned controlFresh = 0, controlSequence = 0, requested = 0, limit = 100, applied = 0;
     unsigned tvActive = 0, edActive = 0, fault = 0, dacLeft = 0, dacRight = 0;
-    unsigned sasRaw = 0, imuValid = 0;
+    // Optional IMU/SAS fields are declared above with the base fields.
     unsigned long uartRx = 0, uartErrors = 0;
     const char* control = strstr(line, " ctl=");
     if (control != nullptr && sscanf(
@@ -516,25 +856,50 @@ void parseRearUartLine(const char* line) {
         state.sasRaw = static_cast<uint16_t>(sasRaw & 0x3fffu);
         state.sasMs = now;
         state.imuValid = imuValid != 0u;
-        state.rearUartRx = static_cast<uint32_t>(uartRx);
-        state.rearUartErrors = static_cast<uint32_t>(uartErrors);
+        // These are commands received by STM, not telemetry received by ESP.
+        state.rearCommandRx = static_cast<uint32_t>(uartRx);
+        state.rearCommandErrors = static_cast<uint32_t>(uartErrors);
+        state.rearExtendedMs = now;
+    } else {
+        // Legacy firmware reports RPM/TPS only; do not retain old optional data.
+        if (!tqvExtended) state.rearExtendedMs = 0;
+        state.driverMs = 0;
+        state.configAck = false;
     }
+    long steeringMilli = 0;
+    unsigned sasValid = 0, sasCenter = 0;
+    const char* steering = strstr(line, " steer=");
+    state.sasValid = false;
+    state.steeringRad = 0.0f;
+    if (steering != nullptr && sscanf(steering, " steer=%ld sv=%u sc=%u",
+            &steeringMilli, &sasValid, &sasCenter) == 3 &&
+            steeringMilli >= -3142 && steeringMilli <= 3142 && sasValid <= 1u && sasCenter < 16384u) {
+        state.sasValid = sasValid != 0u;
+        state.sasCenterRaw = static_cast<uint16_t>(sasCenter);
+        state.steeringRad = static_cast<float>(steeringMilli) / 1000.0f;
+    }
+    ++state.rearUartRx;
+    return true;
 }
 
+bool rearSamplePending = false;
+void publishTelemetry();
+
 void receiveRearUart() {
-    static char line[160];
-    static size_t length = 0;
+    static RearUartLine line;
+    if (digitalRead(EV_REAR_UART_RX_GPIO) == HIGH) ++state.rearRxHigh;
+    else ++state.rearRxLow;
     while (rearUart.available()) {
-        const char value = static_cast<char>(rearUart.read());
-        if (value == '\n') {
-            line[length] = '\0';
-            parseRearUartLine(line);
-            length = 0;
-        } else if (value != '\r') {
-            if (length + 1u < sizeof(line)) {
-                line[length++] = value;
-            } else {
-                length = 0;
+        ++state.rearUartBytes;
+        const auto result = line.push(static_cast<char>(rearUart.read()));
+        if (result == RearUartLine::Dropped) {
+            ++state.rearUartErrors;
+        } else if (result == RearUartLine::Ready && line.data()[0] != '\0') {
+            if (!parseRearUartLine(line.data())) ++state.rearUartErrors;
+            else {
+                // Snapshot each complete Rear record before parsing the next.
+                rearSamplePending = true;
+                publishTelemetry();
             }
         }
     }
@@ -584,9 +949,11 @@ void acceptLiveTvCommand(const String& input) {
 }
 
 void forwardLiveTvCommand() {
+    if (EV_RECEIVE_ONLY) return;
     static uint32_t previous = 0u;
     const uint32_t now = millis();
     if (!rearUartReady || !liveCommandSeen || now - liveCommandMs > 500u ||
+        state.rearExtendedMs == 0u || now - state.rearExtendedMs >= 300u ||
         now - previous < 100u) {
         return;
     }
@@ -597,6 +964,7 @@ void forwardLiveTvCommand() {
 }
 
 void handleCommand(const String& input) {
+    if (EV_RECEIVE_ONLY) return;
     if (jsonStringEquals(input, "type", "live_tv")) {
         acceptLiveTvCommand(input);
     } else if (jsonStringEquals(input, "type", "pit_config")) {
@@ -633,22 +1001,61 @@ void receiveCommands() {
 
 void publishTelemetry() {
     static uint32_t previous = 0;
-    if (millis() - previous < 20u) return;
+    // Every Rear record is published immediately. With no Rear input, retain
+    // a 1 Hz heartbeat/BMS update; never poll-and-overwrite multiple records.
+    if (!rearSamplePending && millis() - previous < (EV_REAR_UART_MODE ? 1000u : 200u)) return;
+    rearSamplePending = false;
     previous = millis();
     ++state.sequence;
     const bool driverFresh = state.driverMs != 0u && millis() - state.driverMs < 200u;
     const bool rearFresh = state.rearMs != 0u && millis() - state.rearMs < 300u;
+    const bool rearOutputFresh = rearFresh && state.rearExtendedMs != 0u &&
+                                 millis() - state.rearExtendedMs < 300u;
+    const bool tqvInternalFresh = rearFresh && state.tqvInternalMs != 0u &&
+                                  millis() - state.tqvInternalMs < 300u;
     const bool sasFresh = state.sasMs != 0u && millis() - state.sasMs < 200u;
     const bool tpsFresh = state.tpsMs != 0u && millis() - state.tpsMs < 300u;
-    const bool tpsOk = tpsFresh && state.tpsRaw >= 818u && state.tpsRaw <= 3152u;
+    // tv_stm_esp: TPS_ADC_MIN/MAX=885/2820, margin=200.
+    const bool tpsOk = tpsFresh && state.tpsRaw >= 685u && state.tpsRaw <= 3020u;
+    const bool frontFresh = rearOutputFresh && state.fault != 1u;
+    const bool rpmLeftOk = rearFresh && (EV_REAR_UART_MODE ? state.rpmLeftValid : state.rpmLeft != 0u);
+    const bool rpmRightOk = rearFresh && (EV_REAR_UART_MODE ? state.rpmRightValid : state.rpmRight != 0u);
+    const char* rpmLeftQuality = !rearFresh ? "NO_DATA" : rpmLeftOk ? "OK" :
+        state.captureLeft == 0u ? "NO_PULSES" : state.glitchLeft > 0u ? "NOISY" : "UNVERIFIED";
+    const char* rpmRightQuality = !rearFresh ? "NO_DATA" : rpmRightOk ? "OK" :
+        state.captureRight == 0u ? "NO_PULSES" : state.glitchRight > 0u ? "NOISY" : "UNVERIFIED";
     const float sasRelative = sasFresh ? sasRelativeDeg() : 0.0f;
     const bool tvLimited = state.tvApplied + 1u < state.tvRequested;
     const bool regenReady = (state.rearFlags & DJY_REAR_STATUS_REGEN_READY) != 0;
-    const char* reason = EV_REAR_UART_MODE && !driverFresh ? "PIT_CONTROL_TIMEOUT" :
+    const char* reason = EV_REAR_UART_MODE && EV_RECEIVE_ONLY ?
+                         (!rearFresh ? "REAR_STATUS_TIMEOUT" : state.fault ? "STM_FAULT" : "NONE") :
+                         EV_REAR_UART_MODE && !driverFresh ? "PIT_CONTROL_TIMEOUT" :
                          !driverFresh ? "DRIVER_CONTROL_TIMEOUT" :
                          !rearFresh ? "REAR_STATUS_TIMEOUT" :
                          (!regenReady && state.regenRequested > 0) ? "REGEN_INTERFACE_UNVALIDATED" :
                          tvLimited ? "PIT_LIMIT_OR_RAMP" : "NONE";
+
+    const bool bmsOnline = bms.lastRxMs != 0u && millis() - bms.lastRxMs < 2000u;
+    bool bmsFault = false;
+    char alarmHex[17] = {};
+    char cellsJson[512] = "[";
+    size_t cellsLength = 1;
+    bool firstCell = true;
+    for (uint8_t i = 0; i < 8; ++i) {
+        bmsFault = bmsFault || bms.alarm[i] != 0;
+        snprintf(alarmHex + i * 2u, sizeof(alarmHex) - i * 2u, "%02X", bms.alarm[i]);
+    }
+    for (uint8_t i = 0; i < bms.cellCount; ++i) {
+        if (!bms.cellSeen[i]) continue;
+        const int written = snprintf(cellsJson + cellsLength, sizeof(cellsJson) - cellsLength,
+                                     "%s%.3f", firstCell ? "" : ",", bms.cells[i]);
+        if (written <= 0 || static_cast<size_t>(written) >= sizeof(cellsJson) - cellsLength) break;
+        cellsLength += static_cast<size_t>(written);
+        firstCell = false;
+    }
+    strlcat(cellsJson, "]", sizeof(cellsJson));
+    const char* bmsState = bms.state == 1 ? "CHARGING" : bms.state == 2 ? "DISCHARGING" :
+                           bms.state == 0 ? "STANDBY" : "UNKNOWN";
 
     uint32_t relayTx = 0, relayErrors = 0, relayCommands = 0;
     int relayHttpStatus = 0, relayDns = 0, relayTcp443 = 0, relayTls = 0;
@@ -663,63 +1070,149 @@ void publishTelemetry() {
     relayTls = relayTlsError;
     portEXIT_CRITICAL(&relayMux);
 #endif
-    char json[1536];
-    snprintf(json, sizeof(json),
-        "{\"seq\":%lu,\"timestamp_ms\":%lu,\"rpm_left\":%u,\"rpm_right\":%u,"
-        "\"speed_kmh\":%.2f,\"tps_raw\":%u,\"tps_pct\":%.2f,\"dac_left\":%u,\"dac_right\":%u,"
-        "\"tps_ok\":%s,\"sas_raw\":%u,\"sas_center_raw\":%u,\"sas_absolute_deg\":%.2f,"
-        "\"sas_relative_deg\":%.2f,\"sas_deg\":%.2f,\"sas_ok\":%s,\"front_sensor_online\":%s,\"front_source\":\"%s\","
+    char json[kTelemetryJsonSize];
+    char timingJson[256];
+    if(!state.timing.json(timingJson,sizeof(timingJson)))return;
+    int jsonLength = snprintf(json, sizeof(json),
+        "{\"board_timing\":%s,\"seq\":%lu,\"timestamp_ms\":%lu,\"rpm_left\":%u,\"rpm_right\":%u,"
+        "\"rpm_left_reported\":%u,\"rpm_right_reported\":%u,\"rpm_left_reported_online\":%s,\"rpm_right_reported_online\":%s,"
+        "\"rpm_left_quality\":\"%s\",\"rpm_right_quality\":\"%s\","
+        "\"cap_left\":%lu,\"cap_right\":%lu,\"rpm_glitch_left\":%lu,\"rpm_glitch_right\":%lu,"
+        "\"rear_desync_left\":%lu,\"rear_desync_right\":%lu,"
+        "\"rpm_left_online\":%s,\"rpm_right_online\":%s,\"motor_left_ok\":%s,\"motor_right_ok\":%s,"
+        "\"speed_kmh\":%.2f,\"speed_online\":%s,\"tps_raw\":%u,\"tps_pct\":%.2f,\"tps_online\":%s,\"tps_ok\":%s,\"dac_left\":%u,\"dac_right\":%u,"
+        "\"sas_raw\":%u,\"sas_center_raw\":%u,\"sas_absolute_deg\":%.3f,"
+        "\"sas_relative_deg\":%.3f,\"sas_deg\":%.3f,\"sas_online\":%s,\"sas_ok\":%s,\"front_sensor_online\":%s,\"front_source\":\"FRONT CAN / REAR UART\","
         "\"tv_requested_pct\":%u,\"tv_applied_pct\":%u,\"regen_requested_pct\":%u,\"regen_applied_pct\":%u,"
         "\"tv_limit_pct\":%u,\"regen_limit_pct\":%u,\"tv_ramp_pct_s\":%u,\"regen_ramp_pct_s\":%u,"
         "\"drive_mode\":%u,\"driver_control_seq\":%u,\"rear_status_seq\":%u,\"config_seq\":%u,\"config_ack\":%s,"
-        "\"driver_control_fresh\":%s,\"tv_active\":%s,\"regen_ready\":%s,\"regen_active\":%s,"
+        "\"driver_control_fresh\":%s,\"tv_active\":%s,\"ed_active\":%s,\"regen_ready\":%s,\"regen_active\":%s,"
         "\"tv_limited\":%s,\"regen_limited\":%s,\"pit_adjust_allowed\":%s,"
-        "\"can_ok\":%s,\"uart_ok\":%s,\"stm_online\":%s,\"imu_ok\":%s,\"fault_code\":%u,"
-        "\"rear_uart_rx\":%lu,\"rear_uart_errors\":%lu,\"limit_reason\":\"%s\","
+        "\"can_ok\":%s,\"uart_ok\":%s,\"stm_online\":%s,\"imu_ok\":%s,\"imu_online\":%s,\"yaw_rate_rad_s\":%.3f,\"lateral_accel_m_s2\":%.3f,\"longitudinal_accel_m_s2\":%.3f,\"imu_raw_ax_m_s2\":%.3f,\"imu_raw_ay_m_s2\":%.3f,\"imu_raw_az_m_s2\":%.3f,"
+        "\"rear_output_online\":%s,\"tqv_internal_online\":%s,"
+        "\"pid_kp\":%.3f,\"pid_ki\":%.3f,\"pid_kd\":%.3f,\"pid_online\":%s,"
+        "\"vehicle_speed_m_s\":%.3f,\"desired_yaw_rad_s\":%.3f,\"yaw_error_rad_s\":%.3f,\"delta_power_kw\":%.3f,\"power_left_kw\":%.3f,\"power_right_kw\":%.3f,\"traction_scale\":%.3f,\"fault_code\":%u,"
+        "\"rear_uart_rx\":%lu,\"rear_uart_errors\":%lu,\"rear_uart_bytes\":%lu,\"rear_rx_high\":%lu,\"rear_rx_low\":%lu,\"rear_command_rx\":%lu,\"rear_command_errors\":%lu,"
+        "\"stm_can_rx\":%lu,\"stm_can_errors\":%lu,\"stm_can_status\":%lu,"
+        "\"stm_imu_diag_0\":%lu,\"stm_imu_diag_1\":%lu,\"stm_imu_diag_2\":%lu,\"stm_imu_diag_3\":%lu,\"limit_reason\":\"%s\","
         "\"command_source\":\"%s\",\"live_control_allowed\":%s,"
-        "\"wifi_connected\":%s,\"wifi_rssi_dbm\":%ld,\"internet_relay_enabled\":%s,"
+        "\"wifi_connected\":%s,\"wifi_status_code\":%d,\"wifi_reconnect_attempts\":%lu,\"wifi_rssi_dbm\":%ld,\"internet_relay_enabled\":%s,"
         "\"internet_relay_tx\":%lu,\"internet_relay_errors\":%lu,\"internet_relay_commands\":%lu,"
         "\"internet_relay_last_http_status\":%d,\"internet_relay_dns_ok\":%d,"
         "\"internet_relay_tcp443_ok\":%d,\"internet_relay_tls_error\":%d}",
-        static_cast<unsigned long>(state.sequence), static_cast<unsigned long>(millis()),
-        state.rpmLeft, state.rpmRight, speedKmh(), state.tpsRaw, throttlePercent(), state.dacLeft, state.dacRight,
-        tpsOk ? "true" : "false", state.sasRaw, kSasCenterRaw, sasAbsoluteDeg(),
-        sasRelative, sasRelative * kSasToSteeringRatio,
-        sasFresh ? "true" : "false", (sasFresh || tpsFresh) ? "true" : "false",
-        EV_REAR_UART_MODE ? "REAR UART / ESP" : "CAN / ESP",
+        timingJson,static_cast<unsigned long>(state.sequence), static_cast<unsigned long>(millis()),
+        state.rpmLeft, state.rpmRight,
+        state.rpmLeft, state.rpmRight, rearFresh ? "true" : "false", rearFresh ? "true" : "false",
+        rpmLeftQuality, rpmRightQuality,
+        static_cast<unsigned long>(state.captureLeft), static_cast<unsigned long>(state.captureRight),
+        static_cast<unsigned long>(state.glitchLeft), static_cast<unsigned long>(state.glitchRight),
+        static_cast<unsigned long>(state.desyncLeft), static_cast<unsigned long>(state.desyncRight),
+        rpmLeftOk ? "true" : "false", rpmRightOk ? "true" : "false",
+        rpmLeftOk ? "true" : "false", rpmRightOk ? "true" : "false",
+        speedKmh(), (rpmLeftOk && rpmRightOk && (!EV_REAR_UART_MODE || tqvInternalFresh)) ? "true" : "false",
+        state.tpsRaw, throttlePercent(),
+        (tpsFresh && frontFresh) ? "true" : "false",
+        (tpsOk && frontFresh && state.fault != 2u) ? "true" : "false",
+        state.dacLeft, state.dacRight,
+        state.sasRaw, state.sasCenterRaw, state.sasRaw * (360.0f / 16384.0f),
+        (static_cast<int>(state.sasRaw) - state.sasCenterRaw) * (360.0f / 16384.0f),
+        state.steeringRad * (180.0f / PI),
+        (rearFresh && frontFresh && state.sasValid) ? "true" : "false",
+        (rearFresh && frontFresh && state.sasValid) ? "true" : "false",
+        frontFresh ? "true" : "false",
         state.tvRequested, state.tvApplied, state.regenRequested, state.regenApplied,
         state.tvLimit, state.regenLimit, state.tvRamp, state.regenRamp,
         state.driveMode, state.driverSequence, state.rearSequence, state.configSequence, state.configAck ? "true" : "false",
         driverFresh ? "true" : "false", (state.rearFlags & DJY_REAR_STATUS_TV_ACTIVE) ? "true" : "false",
-        regenReady ? "true" : "false", state.regenApplied > 0 ? "true" : "false",
+        state.edActive ? "true" : "false", regenReady ? "true" : "false", state.regenApplied > 0 ? "true" : "false",
         tvLimited ? "true" : "false", state.regenApplied + 1u < state.regenRequested ? "true" : "false",
         pitAllowed() ? "true" : "false", (!EV_REAR_UART_MODE && driverFresh && rearFresh) ? "true" : "false",
         (EV_REAR_UART_MODE && rearFresh) ? "true" : "false",
-        rearFresh ? "true" : "false", state.imuValid ? "true" : "false", state.fault,
-        static_cast<unsigned long>(state.rearUartRx), static_cast<unsigned long>(state.rearUartErrors), reason,
+        rearFresh ? "true" : "false", (rearFresh && state.imuValid) ? "true" : "false", (rearFresh && state.imuValid) ? "true" : "false",
+        state.yawRateRadS, state.lateralAccelMS2, state.longitudinalAccelMS2,
+        state.imuRawAx, state.imuRawAy, state.imuRawAz,
+        rearOutputFresh ? "true" : "false", tqvInternalFresh ? "true" : "false",
+        state.pidKp, state.pidKi, state.pidKd,
+        (rearFresh && state.pidMs != 0u && millis() - state.pidMs < 300u) ? "true" : "false",
+        state.vehicleSpeedMS, state.desiredYawRadS, state.yawErrorRadS,
+        state.deltaPowerKw, state.powerLeftKw, state.powerRightKw, state.tractionScale, state.fault,
+        static_cast<unsigned long>(state.rearUartRx), static_cast<unsigned long>(state.rearUartErrors),
+        static_cast<unsigned long>(state.rearUartBytes),
+        static_cast<unsigned long>(state.rearRxHigh), static_cast<unsigned long>(state.rearRxLow),
+        static_cast<unsigned long>(state.rearCommandRx), static_cast<unsigned long>(state.rearCommandErrors),
+        static_cast<unsigned long>(state.stmCanRx), static_cast<unsigned long>(state.stmCanErrors),
+        static_cast<unsigned long>(state.stmCanStatus),
+        static_cast<unsigned long>(state.stmImuDiag0), static_cast<unsigned long>(state.stmImuDiag1),
+        static_cast<unsigned long>(state.stmImuDiag2), static_cast<unsigned long>(state.stmImuDiag3), reason,
         (EV_REAR_UART_MODE && driverFresh) ? "PIT" : "WHEEL",
-        (EV_REAR_UART_MODE && rearFresh) ? "true" : "false",
+        (!EV_RECEIVE_ONLY && EV_REAR_UART_MODE && rearFresh && state.rearExtendedMs != 0u &&
+         millis() - state.rearExtendedMs < 300u) ? "true" : "false",
         WiFi.status() == WL_CONNECTED ? "true" : "false",
+        static_cast<int>(WiFi.status()), static_cast<unsigned long>(wifiReconnectAttempts),
         WiFi.status() == WL_CONNECTED ? static_cast<long>(WiFi.RSSI()) : -127L,
         EV_RELAY_ENABLED ? "true" : "false",
         static_cast<unsigned long>(relayTx), static_cast<unsigned long>(relayErrors),
         static_cast<unsigned long>(relayCommands), relayHttpStatus, relayDns, relayTcp443, relayTls);
+    if (jsonLength < 0 || static_cast<size_t>(jsonLength) >= sizeof(json)) return;
+    const int bmsJsonLength = snprintf(json + jsonLength - 1, sizeof(json) - static_cast<size_t>(jsonLength) + 1,
+        ",\"bms_online\":%s,\"bms_ok\":%s,\"bms_fault\":%s,\"bms_source\":\"ESP CAN\","
+        "\"bms_model\":\"DALY R24TS\",\"bms_protocol\":\"DALY CAN 250k\",\"bms_state\":\"%s\","
+        "\"bms_age_ms\":%lu,\"battery_pack_voltage_v\":%.1f,\"battery_current_a\":%.1f,"
+        "\"battery_power_kw\":%.3f,\"battery_soc_pct\":%.1f,\"bms_life_pct\":%u,"
+        "\"bms_remaining_capacity_ah\":%.3f,\"bms_cell_count\":%u,\"bms_temp_count\":%u,"
+        "\"bms_max_cell_voltage_v\":%.3f,\"bms_min_cell_voltage_v\":%.3f,"
+        "\"bms_max_cell_number\":%u,\"bms_min_cell_number\":%u,\"bms_cell_delta_mv\":%.1f,"
+        "\"bms_temp_max_c\":%.1f,\"bms_temp_min_c\":%.1f,\"bms_cycle_count\":%u,"
+        "\"bms_charge_mos_on\":%s,\"bms_discharge_mos_on\":%s,\"bms_charger_present\":%s,"
+        "\"bms_load_present\":%s,\"bms_balancing\":%s,\"bms_alarm_hex\":\"%s\","
+        "\"bms_alarm_summary\":\"%s\",\"bms_cell_voltages_v\":%s}",
+        bmsOnline ? "true" : "false", bmsOnline && !bmsFault ? "true" : "false",
+        bmsFault ? "true" : "false", bmsState,
+        bmsOnline ? static_cast<unsigned long>(millis() - bms.lastRxMs) : 0ul,
+        bms.voltage, bms.current, bms.voltage * bms.current / 1000.0f, bms.soc, bms.life,
+        bms.remainingAh, bms.cellCount, bms.tempCount, bms.maxCell, bms.minCell,
+        bms.maxCellNumber, bms.minCellNumber, (bms.maxCell - bms.minCell) * 1000.0f,
+        bms.maxTemp, bms.minTemp, bms.cycleCount,
+        bms.chargeMos ? "true" : "false", bms.dischargeMos ? "true" : "false",
+        bms.charger ? "true" : "false", bms.load ? "true" : "false",
+        bms.balancing ? "true" : "false", alarmHex, bmsFault ? "ALARM" : "NONE", cellsJson);
+    if (bmsJsonLength < 0 || static_cast<size_t>(bmsJsonLength) >= sizeof(json) - static_cast<size_t>(jsonLength) + 1u) return;
+    jsonLength += bmsJsonLength - 1;  // BMS fields replace the original closing brace.
 
     if (EV_LOCAL_UDP_ENABLED && WiFi.status() == WL_CONNECTED) {
-        telemetryUdp.beginPacket(pitHost, EV_TELEMETRY_PORT);
-        telemetryUdp.write(reinterpret_cast<const uint8_t*>(json), strlen(json));
-        telemetryUdp.endPacket();
+        // NetworkUDP::write() auto-flushes every 1460 bytes as a NEW datagram,
+        // splitting this JSON into independently invalid messages. Native UDP
+        // sends one datagram; IP fragmentation/reassembly stays below the app.
+        if (telemetrySocket < 0) telemetrySocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (telemetrySocket >= 0) {
+            sockaddr_in target = {};
+            target.sin_family = AF_INET;
+            target.sin_port = htons(EV_TELEMETRY_PORT);
+            target.sin_addr.s_addr = static_cast<uint32_t>(pitHost);
+            const int sent = sendto(telemetrySocket, json, static_cast<size_t>(jsonLength), MSG_DONTWAIT,
+                                    reinterpret_cast<const sockaddr*>(&target), sizeof(target));
+            if (sent != jsonLength) {
+                close(telemetrySocket);
+                telemetrySocket = -1;
+            }
+        }
     }
 #if EV_RELAY_ENABLED
     stageRelayTelemetry(json);
 #endif
-    Serial.println(json);
+    // Queue USB debug at 1 Hz; never block UART reception for a 3 KB JSON.
+    static uint32_t lastUsbMs = 0;
+    if (millis() - lastUsbMs >= 1000u && Serial.availableForWrite() >= jsonLength + 2) {
+        Serial.println(json);
+        lastUsbMs = millis();
+    }
     state.configAck = false;
 }
 
 }  // namespace
 
 void setup() {
+    Serial.setTxBufferSize(4096);
     Serial.begin(115200);
     Serial.setTimeout(10);
     Serial.println("# DJY ESP gateway boot");
@@ -727,9 +1220,21 @@ void setup() {
     pinMode(EV_PIT_ENABLE_GPIO, INPUT_PULLUP);
 
     if (EV_REAR_UART_MODE) {
+        rearUart.setRxBufferSize(1024); // One extended line exceeds the default 256 bytes.
         rearUart.begin(115200, SERIAL_8N1, EV_REAR_UART_RX_GPIO, EV_REAR_UART_TX_GPIO);
-        rearUartReady = true;
-        Serial.println("# Rear UART ready: RX GPIO18 / TX GPIO17, 115200 8N1");
+        rearUartReady = static_cast<bool>(rearUart);
+        Serial.printf("# Rear UART ready=%u RX GPIO%d TX GPIO%d, 115200 8N1, receive_only=%u\n",
+                      rearUartReady, EV_REAR_UART_RX_GPIO, EV_REAR_UART_TX_GPIO, EV_RECEIVE_ONLY);
+#if EV_BMS_CAN_ENABLED
+        const twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(
+            static_cast<gpio_num_t>(EV_BMS_CAN_TX_GPIO), static_cast<gpio_num_t>(EV_BMS_CAN_RX_GPIO), TWAI_MODE_NORMAL);
+        const twai_timing_config_t timing = TWAI_TIMING_CONFIG_250KBITS();
+        const twai_filter_config_t filter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+        if (twai_driver_install(&general, &timing, &filter) == ESP_OK)
+            bmsCanReady = twai_start() == ESP_OK;
+        Serial.printf("# DALY CAN ready=%u TX GPIO%d RX GPIO%d 250kbps extended read-only\n",
+                      bmsCanReady, EV_BMS_CAN_TX_GPIO, EV_BMS_CAN_RX_GPIO);
+#endif
     } else {
         const twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(
             static_cast<gpio_num_t>(EV_CAN_TX_GPIO), static_cast<gpio_num_t>(EV_CAN_RX_GPIO), TWAI_MODE_NORMAL);
@@ -745,6 +1250,7 @@ void setup() {
     WiFi.setSleep(false);
     WiFi.setAutoReconnect(true);
     WiFi.begin(EV_WIFI_SSID, EV_WIFI_PASSWORD);
+    wifiLastReconnectMs = millis();
     pitHost.fromString(EV_PIT_HOST);
     commandUdp.begin(EV_COMMAND_PORT);
     setStatusLed(0, 0, 64);
@@ -757,9 +1263,11 @@ void setup() {
 void loop() {
     if (rearUartReady) receiveRearUart();
     else receiveCan();
+    receiveBmsCan();
     receiveCommands();
     forwardLiveTvCommand();
     sendEspStatus();
+    maintainWifi();
     updateStatusLed();
     publishTelemetry();
     delay(1);

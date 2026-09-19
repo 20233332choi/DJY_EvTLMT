@@ -58,6 +58,92 @@ void EndMetric() { ImGui::SetWindowFontScale(1.0f); }
 
 }  // namespace
 
+void DashboardUI::RenderImuGeometry(const EVTelemetry& t) {
+    ImGui::SeparatorText("IMU G-미터 (F1 스타일)");
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    const float size = std::clamp(std::min(available.x, 190.0f), 150.0f, 190.0f);
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const ImVec2 center(origin.x + size * 0.5f, origin.y + size * 0.5f);
+    const float radius = size * 0.36f;
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const bool valid = t.imuOnline && t.imuOk;
+    float displayLateral = t.lateralAccelMS2;
+    float displayLongitudinal = t.longitudinalAccelMS2;
+    const bool rawAxesAvailable = std::fabs(t.imuRawAxMS2) + std::fabs(t.imuRawAyMS2) +
+                                  std::fabs(t.imuRawAzMS2) > 0.5f;
+    const char* axisMapping = "STM 기준 횡/종축";
+    // 현재 센서에서는 Ay가 중력(-9.8 m/s²)을 받고 있어 화면 횡축으로 쓰면
+    // 점이 한쪽에 고정된다. Ay가 수직축으로 감지될 때만 X/Z를 화면축으로
+    // 사용한다. 제어용 lateral/longitudinal 값은 변경하지 않는다.
+    if (rawAxesAvailable && std::fabs(t.imuRawAyMS2) >= 6.0f &&
+        std::fabs(t.imuRawAyMS2) >= std::fabs(t.imuRawAxMS2) &&
+        std::fabs(t.imuRawAyMS2) >= std::fabs(t.imuRawAzMS2)) {
+        displayLateral = t.imuRawAxMS2;
+        displayLongitudinal = t.imuRawAzMS2;
+        axisMapping = "Ay 수직 감지 · 화면 X/Z";
+    }
+    const ImU32 ring = valid ? IM_COL32(42, 188, 220, 255) : IM_COL32(110, 116, 128, 180);
+    draw->AddCircle(center, radius, ring, 64, 2.0f);
+    draw->AddLine(ImVec2(center.x - radius, center.y), ImVec2(center.x + radius, center.y), IM_COL32(80, 90, 105, 150), 1.0f);
+    draw->AddLine(ImVec2(center.x, center.y - radius), ImVec2(center.x, center.y + radius), IM_COL32(80, 90, 105, 150), 1.0f);
+    draw->AddText(ImVec2(center.x - 5.0f, center.y - radius - 18.0f), IM_COL32(180, 190, 205, 255), "앞");
+    draw->AddText(ImVec2(center.x + radius + 7.0f, center.y - 7.0f), IM_COL32(180, 190, 205, 255), "우");
+    draw->AddText(ImVec2(center.x - 7.0f, center.y + radius + 5.0f), IM_COL32(145, 155, 170, 255), "뒤");
+    draw->AddText(ImVec2(center.x - radius - 18.0f, center.y - 7.0f), IM_COL32(145, 155, 170, 255), "좌");
+    if (valid) {
+        // 표시용 영점을 뺀 가속도 벡터. 정지 상태는 중앙에 표시한다.
+        const float lateral = displayLateral - imuCenterLateralMS2_;
+        const float longitudinal = displayLongitudinal - imuCenterLongitudinalMS2_;
+        const float x = std::clamp(lateral / 9.80665f, -1.0f, 1.0f);
+        const float y = std::clamp(longitudinal / 9.80665f, -1.0f, 1.0f);
+        const ImVec2 dot(center.x + x * radius * 0.82f,
+                         center.y - y * radius * 0.82f);
+        draw->AddLine(center, dot, IM_COL32(255, 190, 64, 190), 3.0f);
+        draw->AddCircleFilled(dot, 7.0f, IM_COL32(255, 190, 64, 255));
+        draw->AddCircle(dot, 10.0f, IM_COL32(255, 235, 150, 220), 24, 1.5f);
+    }
+    ImGui::Dummy(ImVec2(size, size));
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    ImGui::TextColored(valid ? COLOR_OK_GREEN : COLOR_ALERT_RED, "%s", valid ? "IMU 수신 정상" : "IMU 미수신/무효");
+    if (valid) {
+        ImGui::Text("Yaw rate  %+.3f rad/s", t.yawRateRadS - imuCenterYawRateRadS_);
+        ImGui::Text("횡가속도 %+.3f m/s²", displayLateral - imuCenterLateralMS2_);
+        ImGui::Text("종가속도 %+.3f m/s²", displayLongitudinal - imuCenterLongitudinalMS2_);
+        ImGui::TextDisabled("축 매핑: %s", axisMapping);
+        if (std::fabs(t.yawRateRadS - imuCenterYawRateRadS_) > 0.5f ||
+            std::fabs(displayLateral - imuCenterLateralMS2_) > 3.0f ||
+            std::fabs(displayLongitudinal - imuCenterLongitudinalMS2_) > 3.0f) {
+            ImGui::TextColored(COLOR_WARN_AMBER, "정지 상태 값 확인 필요");
+        }
+    } else {
+        ImGui::TextDisabled("센서 패킷을 기다리는 중");
+    }
+    if (ImGui::Button("현재값 중앙 고정")) {
+        if (valid) {
+            imuCenterLateralMS2_ = displayLateral;
+            imuCenterLongitudinalMS2_ = displayLongitudinal;
+            imuCenterYawRateRadS_ = t.yawRateRadS;
+            imuCenterCaptured_ = true;
+        } else {
+            imuCenterLateralMS2_ = 0.0f;
+            imuCenterLongitudinalMS2_ = 0.0f;
+            imuCenterYawRateRadS_ = 0.0f;
+            imuCenterCaptured_ = false;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("중앙 초기화")) {
+        imuCenterLateralMS2_ = 0.0f;
+        imuCenterLongitudinalMS2_ = 0.0f;
+        imuCenterYawRateRadS_ = 0.0f;
+        imuCenterCaptured_ = false;
+    }
+    ImGui::TextDisabled("%s · 화면 표시용 영점(제어값 변경 없음)",
+                       imuCenterCaptured_ ? "현재값 기준" : "기본 0 기준");
+    ImGui::EndGroup();
+}
+
 DashboardUI::DashboardUI() { ApplyTheme(); }
 
 DashboardUI::~DashboardUI() {
@@ -115,7 +201,7 @@ void DashboardUI::Render(IDataSource* dataSource) {
 void DashboardUI::RenderSystemStatus(IDataSource* source, const EVTelemetry& t) {
     const bool connected = source->IsConnected();
     ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(360, 305), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(360, 430), ImGuiCond_Once);
     ImGui::Begin("시스템 상태", nullptr, ImGuiWindowFlags_NoCollapse);
 
     ImGui::SetWindowFontScale(1.20f);
@@ -153,6 +239,22 @@ void DashboardUI::RenderSystemStatus(IDataSource* source, const EVTelemetry& t) 
         ImGui::EndTable();
     }
 
+    ImGui::SeparatorText("측정 기록");
+    ImGui::TextColored(t.recordingActive ? COLOR_ALERT_RED : COLOR_MUTED,
+                       "%s", t.recordingActive ? "● 기록 중" : "기록 대기");
+    if (t.recordingActive) {
+        ImGui::SameLine();
+        ImGui::Text("세션 %u · %llu개 · %.1f초", t.recordingSessionId,
+                    static_cast<unsigned long long>(t.recordingSampleCount),
+                    t.recordingElapsedS);
+    }
+    const char* recordButton = t.recordingActive ? "측정 종료" : "측정 시작";
+    if (ImGui::Button(recordButton, ImVec2(150, 32))) {
+        SendEVRecordingRequest(!t.recordingActive);
+    }
+    ImGui::TextDisabled("조회: http://127.0.0.1:8766/records");
+    if (t.databasePath[0]) ImGui::TextDisabled("DB: %s", t.databasePath);
+
     ImGui::SeparatorText("표시 창");
     if (ImGui::BeginTable("WindowToggles", 2)) {
         ImGui::TableNextColumn(); ImGui::Checkbox("차량 센서", &showVehicleWindow_);
@@ -182,7 +284,7 @@ void DashboardUI::RenderVehicle(const EVTelemetry& t) {
     if (ImGui::BeginTable("VehiclePrimary", 3, kTableFlags)) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); BeginMetric("차량 속도");
-        const bool speedLive = t.speedOnline || (t.rpmLeftOnline && t.rpmRightOnline);
+        const bool speedLive = t.speedOnline;
         if (speedLive) ImGui::TextColored(COLOR_INFO_CYAN, "%.1f km/h", t.speedKmh); else RenderMissing(t.speedAgeMs); EndMetric();
         ImGui::TableNextColumn(); BeginMetric("좌측 모터");
         if (t.rpmLeftOnline && t.motorLeftOk) ImGui::Text("%u RPM", t.rpmLeft); else if (t.rpmLeftOnline) ImGui::TextColored(COLOR_ALERT_RED, "-- · 값 오류"); else RenderMissing(t.rpmLeftAgeMs); EndMetric();
@@ -219,6 +321,7 @@ void DashboardUI::RenderVehicle(const EVTelemetry& t) {
         if (t.rpmLeftOnline || t.rpmRightOnline) ImGui::TextDisabled("펄스 L/R %u / %u", t.captureLeft, t.captureRight);
         ImGui::EndTable();
     }
+    RenderImuGeometry(t);
 
     ImGui::SeparatorText("TQV 및 회생 상태");
     if (ImGui::BeginTable("VehicleOutput", 4, kTableFlags)) {
@@ -234,6 +337,20 @@ void DashboardUI::RenderVehicle(const EVTelemetry& t) {
         if (t.rearOutputOnline) ImGui::Text("%.0f%% / %.0f%%", t.regenRequestedPercent, t.regenAppliedPercent); else RenderMissing(t.rearOutputAgeMs);
         if (t.rearOutputOnline) ImGui::TextColored(t.regenReady ? COLOR_OK_GREEN : COLOR_WARN_AMBER, "%s", t.regenReady ? "준비" : "검증 대기");
         ImGui::EndTable();
+    }
+
+    if (t.tqvInternalOnline && ImGui::BeginTable("TqvInternal", 4, kTableFlags)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextDisabled("TQV 차량속도"); ImGui::Text("%.3f m/s", t.vehicleSpeedMS);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("목표 / 오차 Yaw"); ImGui::Text("%+.3f / %+.3f rad/s", t.desiredYawRadS, t.yawErrorRadS);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("차동전력 L / R / Δ"); ImGui::Text("%.2f / %.2f / %+.2f kW", t.powerLeftKw, t.powerRightKw, t.deltaPowerKw);
+        ImGui::TableNextColumn(); ImGui::TextDisabled("TV / ED / Traction");
+        if (t.tvActive && t.edActive) ImGui::TextColored(COLOR_ALERT_RED, "배타 조건 위반");
+        else ImGui::Text("%s / %s / %.3f", t.tvActive ? "ON" : "OFF", t.edActive ? "ON" : "OFF", t.tractionScale);
+        ImGui::EndTable();
+    }
+    if (t.rearOutputOnline && !t.tqvInternalOnline) {
+        ImGui::TextColored(COLOR_WARN_AMBER, "TQV 내부 연산값 미수신");
     }
 
     ImGui::TextDisabled("주행모드 %s  |  제한 사유 %s  |  Front 출처 %s",
@@ -360,13 +477,15 @@ void DashboardUI::UpdateGnssTrail(const EVTelemetry& t) {
 }
 
 void DashboardUI::RenderGnss(const EVTelemetry& t, bool connected) {
-    ImGui::SetNextWindowPos(ImVec2(16, 337), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(360, 525), ImGuiCond_Once);
+    ImGui::SetNextWindowPos(ImVec2(16, 462), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(360, 400), ImGuiCond_Once);
     ImGui::Begin("GNSS 트랙맵", &showGnssWindow_, ImGuiWindowFlags_NoCollapse);
 
     const bool live = connected && t.gnssOnline && t.gnssAgeMs < 2000.0f;
     ImGui::TextColored(live ? COLOR_OK_GREEN : COLOR_WARN_AMBER,
-                       live ? "GNSS 실제 위치 수신 중" : "GNSS 수신기 연결 대기");
+                       live ? "휴대폰 GNSS 실제 위치 수신 중" : "휴대폰 GNSS 연결 대기");
+    ImGui::SameLine();
+    ImGui::TextDisabled("출처 %s", live ? t.gnssSource : "--");
     if (ImGui::Button("주행 궤적 초기화")) {
         gnssTrailMeters_.clear();
         gnssOriginValid_ = false;
@@ -376,8 +495,10 @@ void DashboardUI::RenderGnss(const EVTelemetry& t, bool connected) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); ImGui::TextDisabled("Fix / 위성");
         if (live) ImGui::Text("%u / %u개", t.gnssFixType, t.gnssSatellites); else ImGui::Text("--");
-        ImGui::TableNextColumn(); ImGui::TextDisabled("HDOP / 지연");
-        if (live) ImGui::Text("%.2f / %.0f ms", t.gnssHdop, t.gnssAgeMs); else ImGui::Text("--");
+        ImGui::TableNextColumn(); ImGui::TextDisabled("정확도 / 지연");
+        if (live && t.gnssAccuracyM > 0.0f) ImGui::Text("%.1f m / %.0f ms", t.gnssAccuracyM, t.gnssAgeMs);
+        else if (live) ImGui::Text("HDOP %.2f / %.0f ms", t.gnssHdop, t.gnssAgeMs);
+        else ImGui::Text("--");
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); ImGui::TextDisabled("위도");
         if (live) ImGui::Text("%.7f°", t.gnssLatitudeDeg); else ImGui::Text("--");
@@ -467,6 +588,30 @@ bool DashboardUI::SendEVRelayPing() {
         return false;
     }
     snprintf(localControlStatus_, sizeof(localControlStatus_), "링크 시험 %u 전송, ESP 확인 대기", controlRequestId_);
+    return true;
+}
+
+bool DashboardUI::SendEVRecordingRequest(bool start) {
+    SOCKET commandSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (commandSocket == INVALID_SOCKET) {
+        strcpy_s(localControlStatus_, "UDP 소켓 생성 실패");
+        return false;
+    }
+    sockaddr_in target = {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(9005);
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    const char* payload = start ? "{\"type\":\"recording_start\"}" :
+                                  "{\"type\":\"recording_stop\"}";
+    const int length = static_cast<int>(std::strlen(payload));
+    const int sent = sendto(commandSocket, payload, length, 0,
+                            reinterpret_cast<const sockaddr*>(&target), sizeof(target));
+    closesocket(commandSocket);
+    if (sent != length) {
+        strcpy_s(localControlStatus_, "측정 기록 명령 전송 실패");
+        return false;
+    }
+    strcpy_s(localControlStatus_, start ? "측정 기록 시작 요청 전송" : "측정 기록 종료 요청 전송");
     return true;
 }
 

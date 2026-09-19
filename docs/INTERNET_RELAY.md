@@ -132,6 +132,10 @@ Copy `firmware/esp32_ev_gateway/include/config.example.h` to the ignored
 #define EV_VEHICLE_ID "EV"
 ```
 
+기존 설정이 같은 ngrok 도메인의 `http://` URL을 유지하고 있더라도
+`EV_ALLOW_PLAINTEXT_RELAY=0`이면 ESP와 피트 실행기는 런타임에 HTTPS로 승격한다.
+명시적인 HTTP 진단 모드는 위 값을 `1`로 둔 읽기 전용 구성에서만 허용한다.
+
 For an uplink-only bench test, commands must remain disabled:
 
 ```c

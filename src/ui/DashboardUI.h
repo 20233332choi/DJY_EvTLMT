@@ -49,6 +49,12 @@ private:
     double gnssOriginLongitude_ = 0.0;
     std::deque<ImVec2> gnssTrailMeters_;
 
+    // IMU G-미터 표시용 영점. 실제 센서/제어 값에는 적용하지 않는다.
+    float imuCenterLateralMS2_ = 0.0f;
+    float imuCenterLongitudinalMS2_ = 0.0f;
+    float imuCenterYawRateRadS_ = 0.0f;
+    bool imuCenterCaptured_ = false;
+
     EnergyLog recordedLog_;
     int selectedLogSample_ = 0;
 
@@ -56,12 +62,14 @@ private:
     void UpdateGnssTrail(const EVTelemetry& telemetry);
     void RenderSystemStatus(IDataSource* source, const EVTelemetry& telemetry);
     void RenderVehicle(const EVTelemetry& telemetry);
+    void RenderImuGeometry(const EVTelemetry& telemetry);
     void RenderBattery(const EVTelemetry& telemetry, bool connected);
     void RenderGnss(const EVTelemetry& telemetry, bool connected);
     void RenderControl(const EVTelemetry& telemetry, bool connected);
     void RenderRecordedLog();
 
     bool SendEVRelayPing();
+    bool SendEVRecordingRequest(bool start);
     bool SendEVControlRequest();
     bool SendEVLiveControlRequest(bool neutral, bool heartbeat = false);
 };

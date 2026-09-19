@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DJY EV 측정 기록</title>
+  <style>
+    :root { color-scheme: dark; --bg:#071017; --panel:#101c25; --line:#263945; --muted:#8fa3af; --cyan:#37c8dc; --green:#4bdd8a; --amber:#ffbd3e; --red:#ff5964; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:#edf5f7; font:14px/1.45 system-ui,"Malgun Gothic",sans-serif; }
+    header { display:flex; gap:18px; align-items:center; justify-content:space-between; padding:18px 22px; border-bottom:1px solid var(--line); background:#0b161e; position:sticky; top:0; z-index:5; }
+    h1,h2 { margin:0; } h1 { font-size:21px; } h2 { font-size:16px; }
+    button,select { background:#172934; color:#eef7f8; border:1px solid #35505f; border-radius:7px; padding:8px 11px; }
+    button { cursor:pointer; } button:hover { border-color:var(--cyan); }
+    main { padding:16px; display:grid; grid-template-columns:340px minmax(0,1fr); gap:14px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+    .panel-title { padding:13px 15px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .status { display:flex; gap:9px; align-items:center; color:var(--muted); }
+    .dot { width:10px; height:10px; border-radius:50%; background:#53636c; box-shadow:0 0 0 3px #25323a; }
+    .dot.on { background:var(--red); box-shadow:0 0 0 3px #52262c; animation:pulse 1.2s infinite; }
+    @keyframes pulse { 50% { opacity:.45; } }
+    .sessions { max-height:calc(100vh - 170px); overflow:auto; }
+    .session { width:100%; padding:13px 15px; text-align:left; border:0; border-bottom:1px solid #20313b; border-radius:0; background:transparent; }
+    .session.active { background:#16313d; box-shadow:inset 3px 0 var(--cyan); }
+    .session strong { display:block; color:#fff; } .session small { color:var(--muted); }
+    .summary { padding:13px 15px; display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:8px; border-bottom:1px solid var(--line); }
+    .metric { background:#0b161e; border-radius:7px; padding:9px 10px; }
+    .metric span { display:block; color:var(--muted); font-size:12px; } .metric b { font-size:16px; color:var(--cyan); }
+    .toolbar { padding:10px 15px; display:flex; align-items:center; gap:10px; border-bottom:1px solid var(--line); color:var(--muted); }
+    .table-wrap { overflow:auto; max-height:calc(100vh - 405px); }
+    table { border-collapse:collapse; width:max-content; min-width:100%; font-variant-numeric:tabular-nums; }
+    th,td { padding:8px 10px; border-bottom:1px solid #20313b; white-space:nowrap; text-align:right; }
+    th { position:sticky; top:0; background:#152630; color:#a8bbc5; z-index:2; }
+    th:first-child,td:first-child,th:nth-child(2),td:nth-child(2) { text-align:left; }
+    tbody tr { cursor:pointer; } tbody tr:hover { background:#142a34; } tbody tr.selected { background:#173845; }
+    .onText { color:var(--green); font-weight:700; } .offText { color:#778992; } .fault { color:var(--red); font-weight:700; }
+    .json { border-top:1px solid var(--line); padding:12px 15px; }
+    pre { margin:8px 0 0; padding:12px; max-height:260px; overflow:auto; background:#071017; border-radius:7px; color:#bfced5; white-space:pre-wrap; word-break:break-word; }
+    .empty { padding:32px; text-align:center; color:var(--muted); }
+    .error { color:var(--red); } .path { max-width:480px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    @media (max-width:900px) { main { grid-template-columns:1fr; } .sessions { max-height:270px; } .summary { grid-template-columns:repeat(2,1fr); } .table-wrap { max-height:55vh; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>DJY EV 측정 기록</h1><a href="/pit" style="color:#37c8dc">실시간 / 과거 비교 그래프 열기</a><div class="status"><i id="recordDot" class="dot"></i><span id="recordState">상태 확인 중</span></div></div>
+    <div style="display:flex;gap:10px;align-items:center"><span id="dbPath" class="path"></span><button id="refresh">새로고침</button></div>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="panel-title"><h2>측정 세션</h2><span id="sessionCount">0개</span></div>
+      <div id="sessions" class="sessions"><div class="empty">기록을 불러오는 중입니다.</div></div>
+    </section>
+    <section class="panel">
+      <div class="panel-title"><h2 id="sampleTitle">시료 데이터</h2><span id="sampleCount">0개</span></div>
+      <div class="summary">
+        <div class="metric"><span>차량 속도</span><b id="mSpeed">--</b></div>
+        <div class="metric"><span>목표 Yaw / 오차</span><b id="mYaw">--</b></div>
+        <div class="metric"><span>차동전력</span><b id="mPower">--</b></div>
+        <div class="metric"><span>TV / ED / Traction</span><b id="mMode">--</b></div>
+      </div>
+      <div class="toolbar">
+        <label>표시량 <select id="limit"><option>100</option><option selected>250</option><option>500</option><option>1000</option></select></label>
+        <label><input id="autoRefresh" type="checkbox" checked> 기록 중 자동 갱신</label>
+        <span>행을 누르면 해당 시점의 전체 패킷을 봅니다.</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>시각</th><th>SEQ</th><th>TQV 상태</th><th>속도 m/s</th><th>속도 km/h</th><th>목표 Yaw</th><th>Yaw 오차</th>
+            <th>Δ 전력 kW</th><th>좌 kW</th><th>우 kW</th><th>TV</th><th>ED</th><th>Traction</th>
+            <th>Yaw rate</th><th>횡G m/s²</th><th>종G m/s²</th><th>RPM L</th><th>RPM R</th><th>TPS %</th><th>BMS SOC %</th>
+          </tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div id="emptySamples" class="empty">왼쪽에서 세션을 선택하세요.</div>
+      </div>
+      <div class="json"><strong>선택 시료 전체 원본 JSON</strong><pre id="rawJson">행을 선택하세요.</pre></div>
+    </section>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const state = { sessionId: 0, samples: [], recording: false };
+    const n = (value, digits=3) => Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : '--';
+    const timeText = value => value ? new Date(value).toLocaleString('ko-KR', { hour12:false }) : '기록 중';
+    const flag = value => `<span class="${value ? 'onText' : 'offText'}">${value ? 'ON' : 'OFF'}</span>`;
+
+    async function getJson(url) {
+      const response = await fetch(url, { cache:'no-store' });
+      if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
+      return response.json();
+    }
+
+    async function loadStatus() {
+      const s = await getJson('/api/recording/status');
+      state.recording = !!s.recording_active;
+      $('recordDot').classList.toggle('on', state.recording);
+      $('recordState').textContent = state.recording
+        ? `기록 중 · 세션 ${s.recording_session_id} · ${s.recording_sample_count}개 · ${n(s.recording_elapsed_s,1)}초`
+        : '기록 대기';
+      $('dbPath').textContent = s.database_path || 'DB 비활성';
+      $('dbPath').title = s.database_path || '';
+      return s;
+    }
+
+    async function loadSessions(preferredId=state.sessionId) {
+      const data = await getJson('/api/recording/sessions');
+      const sessions = data.sessions || [];
+      $('sessionCount').textContent = `${sessions.length}개`;
+      const host = $('sessions'); host.replaceChildren();
+      if (!sessions.length) {
+        host.innerHTML = '<div class="empty">아직 저장된 측정 세션이 없습니다.<br>C 대시보드에서 측정 시작을 누르세요.</div>';
+        state.sessionId = 0; renderSamples([]); return;
+      }
+      if (!sessions.some(s => s.id === preferredId)) preferredId = sessions[0].id;
+      state.sessionId = preferredId;
+      for (const s of sessions) {
+        const button = document.createElement('button');
+        button.className = `session${s.id === state.sessionId ? ' active' : ''}`;
+        const title = document.createElement('strong'); title.textContent = `세션 #${s.id} · ${s.sample_count}개`;
+        const dates = document.createElement('small'); dates.textContent = `${timeText(s.started_at_utc)} → ${timeText(s.stopped_at_utc)}`;
+        button.append(title, dates);
+        if (s.label) { const label=document.createElement('small'); label.textContent=` · ${s.label}`; button.append(label); }
+        button.onclick = async () => { state.sessionId=s.id; await refreshAll(false); };
+        host.append(button);
+      }
+    }
+
+    function selectSample(sample, row) {
+      document.querySelectorAll('#rows tr').forEach(x => x.classList.remove('selected'));
+      row.classList.add('selected');
+      const t = sample.telemetry || {};
+      const live=!!t.tqv_internal_online;
+      $('mSpeed').textContent = live ? `${n(t.vehicle_speed_m_s)} m/s` : '미수신';
+      $('mYaw').textContent = live ? `${n(t.desired_yaw_rad_s)} / ${n(t.yaw_error_rad_s)}` : '--';
+      $('mPower').textContent = live ? `${n(t.delta_power_kw,2)} kW` : '--';
+      const conflict = !!t.tv_active && !!t.ed_active;
+      $('mMode').textContent = !live ? '미수신' : conflict ? 'TV/ED 배타 위반' : `${t.tv_active?'TV':'--'} / ${t.ed_active?'ED':'--'} / ${n(t.traction_scale)}`;
+      $('mMode').className = conflict ? 'fault' : '';
+      $('rawJson').textContent = JSON.stringify(t, null, 2);
+    }
+
+    function renderSamples(samples, total=0) {
+      state.samples = samples;
+      $('sampleCount').textContent = `${samples.length} / ${total}개`;
+      $('sampleTitle').textContent = state.sessionId ? `세션 #${state.sessionId} 시료` : '시료 데이터';
+      const rows = $('rows'); rows.replaceChildren();
+      $('emptySamples').style.display = samples.length ? 'none' : 'block';
+      if (!samples.length) { $('rawJson').textContent='행을 선택하세요.'; return; }
+      for (const sample of samples) {
+        const t=sample.telemetry || {}, row=document.createElement('tr');
+        const live=!!t.tqv_internal_online;
+        const values = [
+          timeText(sample.captured_at_utc), t.seq ?? '--', live ? '<span class="onText">수신</span>' : '<span class="offText">미수신</span>',
+          live?n(t.vehicle_speed_m_s):'--', n(t.speed_kmh,1), live?n(t.desired_yaw_rad_s):'--', live?n(t.yaw_error_rad_s):'--',
+          live?n(t.delta_power_kw,2):'--', live?n(t.power_left_kw,2):'--', live?n(t.power_right_kw,2):'--',
+          live?flag(!!t.tv_active):'--', live?flag(!!t.ed_active):'--', live?n(t.traction_scale):'--', n(t.yaw_rate_rad_s),
+          n(t.lateral_accel_m_s2,2), n(t.longitudinal_accel_m_s2,2), t.rpm_left ?? '--', t.rpm_right ?? '--',
+          n(t.tps_pct,1), n(t.battery_soc_pct,1)
+        ];
+        values.forEach((value,index) => { const cell=document.createElement('td'); if (index===2||index===10||index===11) cell.innerHTML=value; else cell.textContent=value; row.append(cell); });
+        if (t.tv_active && t.ed_active) row.classList.add('fault');
+        row.onclick=()=>selectSample(sample,row); rows.append(row);
+      }
+      selectSample(samples[samples.length-1], rows.lastElementChild);
+    }
+
+    async function loadSamples() {
+      if (!state.sessionId) { renderSamples([]); return; }
+      const limit=Number($('limit').value);
+      const data=await getJson(`/api/recording/samples?session_id=${state.sessionId}&limit=${limit}`);
+      renderSamples(data.samples || [], data.total || 0);
+    }
+
+    async function refreshAll(resetSelection=false) {
+      try {
+        const s=await loadStatus();
+        const preferred=resetSelection && s.recording_session_id ? s.recording_session_id : state.sessionId;
+        await loadSessions(preferred);
+        await loadSamples();
+      } catch (error) {
+        $('recordState').innerHTML=`<span class="error">불러오기 실패: ${String(error.message)}</span>`;
+      }
+    }
+    $('refresh').onclick=()=>refreshAll(false);
+    $('limit').onchange=loadSamples;
+    setInterval(()=>{ if ($('autoRefresh').checked && state.recording) refreshAll(false); }, 2000);
+    refreshAll(true);
+  </script>
+</body>
+</html>

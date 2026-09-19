@@ -44,7 +44,10 @@ if ($relayUrl -notmatch '^https?://.+/api/vehicle/exchange$') {
     throw 'EV_RELAY_URL must use the EV ngrok URL followed by /api/vehicle/exchange.'
 }
 if ($relayUrl -like 'http://*' -and (Get-IntegerDefine 'EV_ALLOW_PLAINTEXT_RELAY') -ne 1) {
-    throw 'Plain HTTP relay requires EV_ALLOW_PLAINTEXT_RELAY 1 in the ignored ESP config.h.'
+    # The firmware applies the same upgrade before opening its socket. Keep an
+    # old stable ngrok hostname usable without enabling plaintext transport.
+    $relayUrl = 'https://' + $relayUrl.Substring(7)
+    Write-Host 'Legacy relay URL upgraded to verified HTTPS.'
 }
 if ($relayToken.Length -lt 16) {
     throw 'Configure the same private relay token in ESP config.h and the pit environment.'
@@ -67,7 +70,7 @@ try {
     $gatewayArgs = @($gateway, '--http-host', '127.0.0.1')
     if ($EnableControl) { $gatewayArgs += '--enable-control' }
     Start-Process -FilePath 'python.exe' -WorkingDirectory $projectRoot `
-        -WindowStyle Minimized -ArgumentList $gatewayArgs
+        -WindowStyle Hidden -ArgumentList $gatewayArgs
 } finally {
     $env:DJY_EV_RELAY_TOKEN = $oldToken
 }
@@ -104,12 +107,47 @@ try {
     Write-Warning 'ngrok status API is unavailable. Start the EV 8766 tunnel.'
 }
 
-if (-not $SkipDashboard) {
-    Get-Process -Name 'DJY_EvTLMT' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -eq (Join-Path $projectRoot 'bin\DJY_EvTLMT.exe') } |
-        Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Process -FilePath $dashboard -WorkingDirectory $projectRoot -ArgumentList 'ev'
+# The ESP may use a plaintext HTTP endpoint on the bench, while phone browser
+# geolocation requires a secure HTTPS origin. Keep both schemes on the same
+# ngrok development domain and forward them to the same read-only gateway.
+$relayUri = [uri]$relayBaseUrl
+$phoneBaseUrl = "https://$($relayUri.Host)"
+$phoneTunnel = $null
+foreach ($apiPort in 4040,4041,4042) {
+    try {
+        $agent = Invoke-RestMethod -Uri "http://127.0.0.1:$apiPort/api/tunnels" -TimeoutSec 1
+        $phoneTunnel = $agent.tunnels |
+            Where-Object { $_.public_url.TrimEnd('/') -eq $phoneBaseUrl.TrimEnd('/') -and $_.config.addr -match '(:|localhost)8766$' } |
+            Select-Object -First 1
+        if ($phoneTunnel) { break }
+    } catch {}
 }
-Write-Host 'Pit CMake telemetry: UDP 9004'
-$controlStatus = if ($EnableControl) { 'Pit control: ENABLED with CMake deadman' } else { 'Pit control: READ ONLY' }
+if (-not $phoneTunnel) {
+    $ngrok = Get-Command ngrok -ErrorAction Stop
+    Start-Process -FilePath $ngrok.Source -WindowStyle Hidden `
+        -ArgumentList @('http', '8766', '--url', $phoneBaseUrl)
+    for ($attempt = 0; $attempt -lt 20 -and -not $phoneTunnel; $attempt++) {
+        Start-Sleep -Milliseconds 300
+        foreach ($apiPort in 4040,4041,4042) {
+            try {
+                $agent = Invoke-RestMethod -Uri "http://127.0.0.1:$apiPort/api/tunnels" -TimeoutSec 1
+                $phoneTunnel = $agent.tunnels |
+                    Where-Object { $_.public_url.TrimEnd('/') -eq $phoneBaseUrl.TrimEnd('/') -and $_.config.addr -match '(:|localhost)8766$' } |
+                    Select-Object -First 1
+                if ($phoneTunnel) { break }
+            } catch {}
+        }
+    }
+}
+if ($phoneTunnel) {
+    Write-Host "Phone GNSS: $phoneBaseUrl/phone"
+} else {
+    Write-Warning "Phone GNSS HTTPS endpoint did not start: $phoneBaseUrl/phone"
+}
+
+if (-not $SkipDashboard) {
+    Start-Process 'http://127.0.0.1:8766/pit'
+}
+Write-Host 'HTML pit dashboard: http://127.0.0.1:8766/pit'
+$controlStatus = if ($EnableControl) { 'Pit control backend: ENABLED; use run_dashboard.bat native for existing deadman controls' } else { 'Pit control: READ ONLY' }
 Write-Host $controlStatus

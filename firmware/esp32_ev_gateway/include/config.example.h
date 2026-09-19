@@ -8,6 +8,8 @@
 #define EV_TELEMETRY_PORT 9003
 #define EV_COMMAND_PORT 9006
 #define EV_LOCAL_UDP_ENABLED 1
+// Bench receive-only gate: rejects USB/UDP/relay control and never sends TV commands.
+#define EV_RECEIVE_ONLY 1
 
 // Internet relay through the vehicle phone hotspot and an HTTPS endpoint such
 // Direct EV endpoint exposed from pit gateway port 8766 through ngrok.
@@ -25,8 +27,10 @@
 // Plain HTTP is an unencrypted, read-only diagnostic fallback. Never enable
 // EV_RELAY_ACCEPT_COMMANDS with this option.
 #define EV_ALLOW_PLAINTEXT_RELAY 0
-// For verified TLS, define EV_RELAY_CA_CERT as the PEM root CA string used by
-// the HTTPS endpoint, then enable command reception only after validation.
+// Let's Encrypt Generation Y roots (YE/YR) are included for ngrok's chain.
+// EV_RELAY_CA_CERT can override it for another HTTPS endpoint.
+// For ngrok use platformio-modern.ini: verified ECDHE-RSA/AES-GCM avoids
+// the slow ECDSA certificate handshake on this board. No insecure fallback.
 
 // ESP32-S3 DevKitC-1 built-in RGB status LED. On low-voltage GPIO48 board
 // revisions, jumper GPIO38 to GPIO48 and leave this set to 38.
@@ -36,6 +40,10 @@
 
 #define EV_CAN_TX_GPIO 17
 #define EV_CAN_RX_GPIO 18
+
+// DALY R24TS on its separate 250 kbps CAN bus (Rear UART mode only).
+#define EV_BMS_CAN_TX_GPIO 9
+#define EV_BMS_CAN_RX_GPIO 8
 
 // Active-low physical switch. Leave open for read-only telemetry.
 #define EV_PIT_ENABLE_GPIO 4

@@ -43,6 +43,10 @@ struct EVTelemetry {
     char frontSource[32] = "CAN / ESP";
     float yawRateRadS = 0.0f;
     float lateralAccelMS2 = 0.0f;
+    float longitudinalAccelMS2 = 0.0f;
+    float imuRawAxMS2 = 0.0f;
+    float imuRawAyMS2 = 0.0f;
+    float imuRawAzMS2 = 0.0f;
     bool imuOk = false;
     bool imuOnline = false;
     float imuAgeMs = -1.0f;
@@ -57,6 +61,8 @@ struct EVTelemetry {
     float gnssAltitudeM = 0.0f;
     float gnssHeadingDeg = 0.0f;
     float gnssHdop = 0.0f;
+    float gnssAccuracyM = 0.0f;
+    char gnssSource[32] = "GNSS";
     float gnssAgeMs = 0.0f;
 
     std::uint16_t dacLeft = 0;
@@ -64,6 +70,12 @@ struct EVTelemetry {
     float powerLeftKw = 0.0f;
     float powerRightKw = 0.0f;
     float deltaPowerKw = 0.0f;
+    float vehicleSpeedMS = 0.0f;
+    float desiredYawRadS = 0.0f;
+    float yawErrorRadS = 0.0f;
+    float tractionScale = 1.0f;
+    bool edActive = false;
+    bool tqvInternalOnline = false;
     bool rearOutputOnline = false;
     float rearOutputAgeMs = -1.0f;
 
@@ -143,6 +155,12 @@ struct EVTelemetry {
     char commandStatus[16] = "IDLE";
     char commandMessage[96] = "";
     std::uint32_t commandRequestId = 0;
+
+    bool recordingActive = false;
+    std::uint32_t recordingSessionId = 0;
+    std::uint64_t recordingSampleCount = 0;
+    float recordingElapsedS = 0.0f;
+    char databasePath[260] = "";
 
     std::uint64_t receivedPackets = 0;
     std::uint64_t lostPackets = 0;
