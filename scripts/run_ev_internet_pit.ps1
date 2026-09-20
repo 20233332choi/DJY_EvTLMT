@@ -149,5 +149,5 @@ if (-not $SkipDashboard) {
     Start-Process 'http://127.0.0.1:8766/pit'
 }
 Write-Host 'HTML pit dashboard: http://127.0.0.1:8766/pit'
-$controlStatus = if ($EnableControl) { 'Pit control backend: ENABLED; use run_dashboard.bat native for existing deadman controls' } else { 'Pit control: READ ONLY' }
+$controlStatus = if ($EnableControl) { 'Pit control backend: ENABLED; local safety gates remain enforced' } else { 'Pit control: READ ONLY' }
 Write-Host $controlStatus

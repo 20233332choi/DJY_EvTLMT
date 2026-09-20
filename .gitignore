@@ -16,3 +16,5 @@ __pycache__/
 /.local/
 firmware/esp32_ev_gateway/include/config.h
 .pio/
+
+/_archive/

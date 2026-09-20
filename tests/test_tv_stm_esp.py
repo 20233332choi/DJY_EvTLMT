@@ -106,7 +106,7 @@ int main() {
     CHECK(state.sasValid && state.sasCenterRaw==1116 && state.steeringRad==0);
     CHECK(state.rpmLeftValid && state.rpmRightValid && state.imuValid);
     CHECK(state.stmCanRx==0xffffffff && state.stmImuDiag0==0xffffffff);
-    CHECK(std::fabs(speedKmh()-43.2f)<.001f && state.driverMs==0);
+    CHECK(std::fabs(speedKmh()-26.507188f)<.001f && state.driverMs==0);
     CHECK(std::fabs(state.powerRightKw-5)<.001f);
     CHECK(state.pidMs==1000 && state.pidKp==PID_KP && state.pidKi==PID_KI && state.pidKd==PID_KD);
     std::string legacy=huart1.sent.substr(0,huart1.sent.find(" kp="));

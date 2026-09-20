@@ -104,6 +104,7 @@ int main() {
         state.tpsMs=state.tqvInternalMs=clockMs;
         state.tpsRaw=count==14 ? 685 : count==48 ? 3020 : 3021;
         state.vehicleSpeedMS=12.0f;
+        state.rpmLeft=800; state.rpmRight=1200;
         state.rpmLeftValid=state.rpmRightValid=true;
         state.sasRaw=6897; state.sasCenterRaw=6897; state.steeringRad=-0.125f;
         state.sasValid=count==14;
@@ -135,7 +136,7 @@ int main() {
             self.assertEqual(snapshot["sas_online"], count == 14)
             self.assertEqual(snapshot["sas_center_raw"], 6897)
             self.assertEqual(snapshot["tps_ok"], bool(count))
-            self.assertAlmostEqual(snapshot["speed_kmh"], 43.2, places=2)
+            self.assertAlmostEqual(snapshot["speed_kmh"], 21.2057504117, places=2)
             self.assertEqual(packet["limit_reason"], "NONE")
             self.assertAlmostEqual(snapshot["sas_deg"], -7.162, places=2)
             self.assertFalse(store.snapshot(now=5.0)["sas_online"])

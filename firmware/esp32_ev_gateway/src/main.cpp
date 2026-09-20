@@ -510,9 +510,9 @@ float sasRelativeDeg() {
 }
 
 float speedKmh() {
-    // Rear already applies its current gear ratio and wheel calibration.
-    if (EV_REAR_UART_MODE) return state.vehicleSpeedMS * 3.6f;
-    constexpr float kGearRatio = 3.8f, kTireRadiusM = 0.2286f;
+    // User-confirmed tire outside diameter 45 cm and reduction 4:1.
+    // Keep STM vehicleSpeedMS separately as its original control input.
+    constexpr float kGearRatio = 4.0f, kTireRadiusM = 0.225f;
     // A single noisy/missing wheel must never become vehicle speed.
     if ((state.rpmLeft == 0u) != (state.rpmRight == 0u)) return 0.0f;
     const float motorRpm = 0.5f * (state.rpmLeft + state.rpmRight);

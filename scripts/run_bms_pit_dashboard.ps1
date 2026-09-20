@@ -37,5 +37,5 @@ if (-not $SkipDashboard) {
     Start-Process -FilePath $dashboard -WorkingDirectory $projectRoot -ArgumentList 'ev'
 }
 Write-Host "DALY BMS: LIVE on $Port at 9600 bps"
-Write-Host 'Pit CMake telemetry: UDP 9004'
+Write-Host 'HTML pit dashboard: http://127.0.0.1:8766/pit'
 Write-Host 'Vehicle source: waiting on UDP 9003; future ESP wireless BMS fields use the same dashboard contract.'

@@ -1,11 +1,13 @@
 """Read-only adapter for Rear's 115200-baud ST-Link debug records.
 
-No board commands, reset, speed reconstruction or control-logic changes.
+No board commands, reset or control-logic changes. Display speed uses the
+user-confirmed wheel diameter/gear ratio; STM speed remains in its own field.
 Raw records remain available even when a measurement cannot be trusted.
 """
 import re
 import math
 import time
+from vehicle_geometry import speed_kmh
 
 
 class RearStatusParser:
@@ -138,10 +140,10 @@ class RearStatusParser:
             dl, dr = map(int, fields['dac'].split('/'))
             if dl <= 4095 and dr <= 4095:
                 packet.update(dac_left=dl, dac_right=dr, rear_output_online=True)
-        # Keep the STM's computed speed for forensic recording, never invent one.
-        packet['speed_kmh'] = packet.get('vehicle_speed_m_s', 0) * 3.6
-        packet['speed_online'] = ('vehicle_speed_m_s' in packet and
-                                  packet['motor_left_ok'] and packet['motor_right_ok'])
+        # Preserve vehicle_speed_m_s as reported by STM. Display speed uses
+        # the confirmed 45 cm diameter and 4:1 gearing, subject to RPM quality.
+        packet['speed_kmh'] = speed_kmh(left, right)
+        packet['speed_online'] = packet['motor_left_ok'] and packet['motor_right_ok']
         warnings = []
         for side, label in (('left', '좌측'), ('right', '우측')):
             if packet[f'rpm_{side}_quality'] == 'NOISY':

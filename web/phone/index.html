@@ -18,12 +18,31 @@
     .label { color:var(--muted); font-size:12px; }
     .value { margin-top:5px; color:var(--green); font:700 19px ui-monospace,Consolas,monospace; overflow:hidden; }
     pre { min-height:120px; padding:14px; border:1px solid var(--line); border-radius:8px; background:#050b10; color:var(--muted); white-space:pre-wrap; font:13px/1.55 ui-monospace,Consolas,monospace; }
+    .background{padding:18px;border:1px solid var(--cyan);border-radius:10px;margin:20px 0;background:var(--panel)}h2{font-size:19px;margin:0 0 10px}.background a{color:var(--cyan)}.background li{margin:10px 0;line-height:1.6}.background ol{padding-left:22px}.background input{box-sizing:border-box;width:100%;background:#050b10;color:#eef5f8;border:1px solid var(--line);padding:12px;font:13px ui-monospace,monospace}.background button{margin:10px 0}.background small{display:block;line-height:1.6;color:var(--muted)}#nativeStatus{min-height:65px}.web-mode{padding-top:18px;border-top:1px solid var(--line)}
   </style>
 </head>
 <body>
   <main>
     <h1>DJY EV 휴대폰 GNSS</h1>
-    <p class="sub">휴대폰을 차량에 단단히 고정한 뒤 시작하세요. 위치 권한 사용을 위해 ngrok의 HTTPS 주소로 이 페이지를 열어야 합니다.</p>
+    <p class="sub">화면 잠금·다른 앱 사용 중에도 위치를 보내려면 아래 아이폰 앱 연결을 사용하세요. 위치는 현재 대시보드의 지도·기록으로 전달됩니다.</p>
+    <section class="background" aria-labelledby="backgroundTitle">
+      <h2 id="backgroundTitle">아이폰 · 백그라운드 GPS</h2>
+      <ol>
+        <li><a href="https://apps.apple.com/app/id843156974" target="_blank" rel="noopener">Traccar Client 설치 ↗</a> 후 앱을 엽니다. Device identifier는 앱의 기본값을 유지하세요.</li>
+        <li>앱의 <b>Server URL</b>에 아래 주소를 붙여넣습니다. 주소를 설정한 뒤 서비스를 시작하세요.</li>
+      </ol>
+      <input id="nativeUrl" type="text" readonly aria-label="Traccar 서버 주소"><button id="copyNative">서버 주소 복사</button>
+      <ol start="3">
+        <li>아이폰 설정 → 개인정보 보호 및 보안 → 위치 서비스 → Traccar Client에서 <b>항상 허용 · 정확한 위치 켬</b>으로 설정합니다. 처음에는 앱에서 위치 권한 요청을 허용하세요.</li>
+        <li>앱에서 <b>Location accuracy: Highest</b>, <b>Interval: 1초</b>, <b>Stop detection: 끔</b>으로 설정합니다. 버전에 따라 메뉴 이름이 다를 수 있습니다.</li>
+        <li>앱의 서비스를 켠 뒤 화면을 잠급니다. 앱 전환 화면에서 위로 밀어 강제 종료하지 마세요. 주행 측정 중에는 저전력 모드를 끄세요.</li>
+      </ol>
+      <small>1초는 요청 간격이며 아이폰의 실제 위치 제공 주기를 보장하지 않습니다. 통신 후 늦게 도착한 위치는 현재 위치나 유효한 랩타임으로 처리하지 않습니다. 웹 GPS와 앱 GPS는 동시에 켜지 마세요.</small>
+      <pre id="nativeStatus" role="status">앱 연결 확인 중</pre>
+      <small>화면을 잠근 상태에서 다른 기기의 이 페이지로 수신 건수가 증가하는지 확인하세요. 저장은 대시보드의 측정 기록 상태를 따릅니다. 종료할 때는 Traccar Client에서 서비스를 끄세요.</small>
+      <p><a href="/records">저장 데이터 열람</a> · <a href="/map">지도 · 랩타임</a></p>
+    </section>
+    <section class="web-mode"><h2>웹 GPS · 화면을 켜고 사용하는 모드</h2><p class="sub">Safari가 숨겨지거나 화면이 잠기면 웹 GPS는 중단될 수 있습니다. 백그라운드 전송에는 위 앱을 사용하세요.</p></section>
     <button id="toggle">GPS 전송 시작</button>
     <section class="grid">
       <div class="card"><div class="label">속도</div><div class="value" id="speed">--.- km/h</div></div>
@@ -33,90 +52,10 @@
       <div class="card"><div class="label">진행 방향</div><div class="value" id="heading">--.-°</div></div>
       <div class="card"><div class="label">서버 상태</div><div class="value" id="server">대기</div></div>
     </section>
+    <p><a href="/map" style="color:#27c5df">GPS MAP / LAP TIMING</a></p>
     <pre id="status">GPS 전송 대기 중</pre>
   </main>
-  <script>
-    const button = document.getElementById('toggle');
-    const statusEl = document.getElementById('status');
-    let watchId = null;
-    let sending = false;
-    let accepted = 0;
-    let failed = 0;
-    let lastSentAt = 0;
-
-    const show = (id, value) => { document.getElementById(id).textContent = value; };
-
-    function stop() {
-      if (watchId !== null) navigator.geolocation.clearWatch(watchId);
-      watchId = null;
-      sending = false;
-      button.textContent = 'GPS 전송 시작';
-      button.classList.remove('active');
-      statusEl.textContent = `전송 중지됨\n성공 ${accepted} / 실패 ${failed}`;
-    }
-
-    async function sendPosition(position) {
-      const c = position.coords;
-      const payload = {
-        ts: position.timestamp / 1000,
-        lat: c.latitude,
-        lon: c.longitude,
-        accuracy_m: c.accuracy,
-        speed_kmh: c.speed == null ? null : c.speed * 3.6,
-        heading: c.heading,
-        altitude: c.altitude
-      };
-      show('speed', payload.speed_kmh == null ? '--.- km/h' : `${payload.speed_kmh.toFixed(1)} km/h`);
-      show('accuracy', `${payload.accuracy_m.toFixed(1)} m`);
-      show('lat', payload.lat.toFixed(7));
-      show('lon', payload.lon.toFixed(7));
-      show('heading', payload.heading == null ? '--.-°' : `${payload.heading.toFixed(1)}°`);
-      const now = performance.now();
-      if (now - lastSentAt < 800) return;
-      lastSentAt = now;
-      try {
-        const response = await fetch('/api/gnss', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify(payload),
-          keepalive: true
-        });
-        const result = await response.json();
-        if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
-        accepted++;
-        show('server', '수신 중');
-        statusEl.textContent = `GNSS 전송 중\n정확도 ${payload.accuracy_m.toFixed(1)} m\n성공 ${accepted} / 실패 ${failed}`;
-      } catch (error) {
-        failed++;
-        show('server', '전송 오류');
-        statusEl.textContent = `서버 전송 실패\n${error}\n성공 ${accepted} / 실패 ${failed}`;
-      }
-    }
-
-    button.onclick = () => {
-      if (sending) { stop(); return; }
-      if (!window.isSecureContext) {
-        statusEl.textContent = 'GPS 권한을 사용할 수 없는 HTTP 연결입니다. ngrok HTTPS 주소로 접속하세요.';
-        return;
-      }
-      if (!navigator.geolocation) {
-        statusEl.textContent = '이 휴대폰/브라우저는 위치 정보를 지원하지 않습니다.';
-        return;
-      }
-      sending = true;
-      button.textContent = 'GPS 전송 중지';
-      button.classList.add('active');
-      statusEl.textContent = '고정밀 GPS 위치를 기다리는 중';
-      watchId = navigator.geolocation.watchPosition(
-        sendPosition,
-        error => {
-          failed++;
-          show('server', 'GPS 오류');
-          statusEl.textContent = `GPS 오류 ${error.code}\n${error.message}`;
-        },
-        {enableHighAccuracy:true, maximumAge:0, timeout:15000}
-      );
-    };
-  </script>
+  <script src="/phone/app.js"></script>
+  <script src="/phone/background.js"></script>
 </body>
 </html>

@@ -47,6 +47,8 @@ with tempfile.TemporaryDirectory() as directory:
         with sync_playwright() as pw:
             browser=pw.chromium.launch(channel='msedge',headless=True)
             page=browser.new_page(viewport={'width':1440,'height':1050})
+            # Map preview is tested with local placeholder tiles, never OSM scans.
+            page.route('https://tile.openstreetmap.org/**', lambda route: route.abort())
             errors=[]
             page.on('pageerror',lambda error:errors.append(str(error)))
             page.goto(f'http://127.0.0.1:{server.server_port}/pit')

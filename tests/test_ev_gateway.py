@@ -102,7 +102,7 @@ class EVGatewayTests(unittest.TestCase):
                     for sample in samples
                     if "future_controller_value" in sample["telemetry"]
                 ]
-                self.assertEqual(preserved, [{"raw": 77}, {"raw": 77}])
+                self.assertEqual(preserved, [{"raw": 77}])  # Stop must not duplicate the last received sample.
             finally:
                 gateway.database.close()
                 gateway.forward_socket.close()
@@ -140,7 +140,7 @@ class EVGatewayTests(unittest.TestCase):
         self.assertTrue(packet["wifi_connected"])
         self.assertEqual(packet["wifi_rssi_dbm"], -61)
         self.assertEqual(packet["internet_relay_tx"], 12)
-        expected = ((1604 + 2609) / 2 / 3.8) * (2 * math.pi * 0.2286) / 60 * 3.6
+        expected = ((1604 + 2609) / 2 / 4.0) * (math.pi * 0.45) / 60 * 3.6
         self.assertAlmostEqual(packet["speed_kmh"], expected, places=3)
 
     def test_normalizes_future_esp_wireless_bms_packet(self):
@@ -634,8 +634,8 @@ class EVGatewayTests(unittest.TestCase):
             with urllib.request.urlopen(f"{base}/battery", timeout=2) as response:
                 battery = response.read().decode("utf-8")
                 self.assertEqual(response.status, 200)
-                self.assertIn("DALY BMS 상태", battery)
-                self.assertIn("/api/telemetry", battery)
+            self.assertIn('id="packWatts"', battery)
+            self.assertIn('/tuning/battery.js', battery)
         finally:
             server.shutdown()
             server.server_close()
@@ -668,7 +668,7 @@ class EVGatewayTests(unittest.TestCase):
             server.server_close()
             gateway.forward_socket.close()
 
-    def test_http_record_viewer_is_local_only_and_reads_database(self):
+    def test_http_record_viewer_shared_but_raw_database_local_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             gateway = EVGateway(
                 "127.0.0.1", 9003, "127.0.0.1", 9004,
@@ -684,7 +684,7 @@ class EVGatewayTests(unittest.TestCase):
             base = f"http://127.0.0.1:{server.server_port}"
             try:
                 with urllib.request.urlopen(f"{base}/records", timeout=2) as response:
-                    self.assertIn("DJY EV 측정 기록", response.read().decode("utf-8"))
+                    self.assertIn("저장 데이터 열람", response.read().decode("utf-8"))
                 with urllib.request.urlopen(f"{base}/api/recording/sessions", timeout=2) as response:
                     sessions = json.loads(response.read().decode("utf-8"))["sessions"]
                 self.assertEqual(sessions[0]["label"], "viewer-test")
@@ -692,11 +692,16 @@ class EVGatewayTests(unittest.TestCase):
                     f"{base}/api/recording/samples?session_id={sessions[0]['id']}", timeout=2
                 ) as response:
                     samples = json.loads(response.read().decode("utf-8"))
-                self.assertGreaterEqual(samples["total"], 2)
+                self.assertEqual(samples["total"], 1)
                 self.assertEqual(samples["samples"][-1]["telemetry"]["seq"], 12)
 
                 forwarded = urllib.request.Request(
                     f"{base}/records", headers={"X-Forwarded-For": "203.0.113.9"}
+                )
+                with urllib.request.urlopen(forwarded, timeout=2) as response:
+                    self.assertEqual(response.status, 200)
+                forwarded = urllib.request.Request(
+                    f"{base}/api/recording/samples?session_id=1", headers={"X-Forwarded-For": "203.0.113.9"}
                 )
                 with self.assertRaises(urllib.error.HTTPError) as denied:
                     urllib.request.urlopen(forwarded, timeout=2)

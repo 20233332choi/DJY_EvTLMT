@@ -23,7 +23,7 @@ CHANNELS = (
     ("yaw_error_rad_s", "yaw_error · STM 제어 오차", "rad/s", "yaw", ("tqv_internal_online",)),
     ("delta_power_kw", "delta_power · 최종 차동전력", "kW", "power", ("tqv_internal_online",)),
     ("vehicle_speed_m_s", "vehicle_speed · STM 계산값", "m/s", "speed_raw", ("tqv_internal_online",)),
-    ("speed_kmh", "차속 · RPM 품질 통과 / 타이어 보정 미확인", "km/h", "speed", ("speed_online",)),
+    ("speed_kmh", "차속 · RPM 품질 통과 / 지름 45cm / 4:1", "km/h", "speed", ("speed_online",)),
     ("traction_scale", "traction_scale · 개입 배율", "0..1", "traction", ("tqv_internal_online",)),
     ("tv_active", "tv_active · 폐루프 개입", "0/1", "activity", ("tqv_internal_online",)),
     ("ed_active", "ed_active · 개루프 개입", "0/1", "activity", ("tqv_internal_online",)),
@@ -96,7 +96,9 @@ def rpm_status(packet):
 
 
 class TuningStream:
-    def __init__(self, capacity=12000):
+    def __init__(self, capacity=12000, projector=project, status_projector=rpm_status):
+        self.projector = projector
+        self.status_projector = status_projector
         self.lock = threading.Lock()
         self.samples = deque(maxlen=capacity)
         self.cursor = 0
@@ -107,7 +109,7 @@ class TuningStream:
             self.cursor += 1
             self.samples.append({"id": self.cursor, "time_ms": packet.get('sample_time_ms', time.time_ns() // 1000000),
                                  "source_timestamp_ms": packet.get("timestamp_ms"),
-                                 "values": project(packet), "status": rpm_status(packet)})
+                                 "values": self.projector(packet), "status": self.status_projector(packet)})
 
     def read(self, after=0):
         with self.lock:

@@ -135,7 +135,7 @@ class TuningTests(unittest.TestCase):
                 gateway.accept({'seq':10, 'yaw_rate_rad_s':.2, 'imu_ok':True,
                                 'desired_yaw_rad_s':.4, 'tqv_internal_online':True})
                 live = json.loads(get('/api/tuning/live', True))
-                self.assertFalse(live['can_record'])
+                self.assertTrue(live['can_record'])
                 self.assertTrue(live['recording_active'])
                 self.assertEqual(live['current']['yaw_rate_rad_s'], .2)
                 self.assertNotIn('database_path', live)
