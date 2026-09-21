@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 
 from daly_bms import DalyBmsReader
 from stm_serial import rear_records
+from usb_serial import USB_BAUD, usb_lines, decode_usb_line
 from tuning import CHANNELS, INPUTS as TUNING_INPUTS, TuningStream, project as tuning_project, rpm_status
 from battery import CHANNELS as BATTERY_CHANNELS, INPUTS as BATTERY_INPUTS, STATUS_KEYS as BATTERY_STATUS_KEYS, with_power, project as battery_project, status as battery_status
 from vehicle_geometry import GEAR_RATIO, TIRE_RADIUS_M, with_verified_speed
@@ -919,10 +920,11 @@ class TelemetryDatabase:
                         "UPDATE measurement_sessions SET sample_count=? WHERE id=?",
                         (self._sample_count, self._session_id))
                 self._connection.commit()
-            except Exception:
+            except Exception as exc:
                 self._connection.rollback()
                 self._sample_count = previous_count
                 self._last_received_epoch = previous_received
+                self.recording_error = 'DB 저장 실패: ' + type(exc).__name__
                 raise
             finally:
                 self._batching = False
@@ -1080,7 +1082,8 @@ class EVGateway:
         self.input_mode = "WIFI_UDP"
         self.input_port = ""
         self.relay_lock = threading.Lock()
-        self.relay_ingest_lock = threading.Lock()
+        self.relay_ingest_lock = threading.RLock()
+        self.latest_sample_time_ms = float("-inf")
         self.relay_samples = RelaySamples()
         self.relay_pending_command: dict[str, Any] | None = None
         self.relay_pending_until = 0.0
@@ -1105,13 +1108,26 @@ class EVGateway:
             return False
 
     def accept(self, data: Mapping[str, Any], sender: tuple[str, int] | None = None,
-               transport: str = "WIFI_UDP", forward_live: bool = True) -> bool:
-        now = time.monotonic()
+               transport: str = "WIFI_UDP", forward_live: bool = True,
+               pending: list | None = None, tracked: bool = False) -> bool:
         if sender is not None and transport == "WIFI_UDP":
             self.latest_udp_sender = sender
-        if not self._select_transport(transport, now):
+        if not tracked and 'stream_id' in data:
+            batch = {'stream_id': data['stream_id'], 'sent_ms': data.get('timestamp_ms'), 'samples': [data]}
+            return bool(self.telemetry_exchange(batch, transport, str(data.get('vehicle_id', 'EV')))['accepted_samples'])
+        now = time.monotonic()
+        if not tracked and not self._select_transport(transport, now):
             return False
-        packet = self.store.update(data, now=now)
+        source_store = self.store
+        if tracked:
+            if data['sample_time_ms'] < self.latest_sample_time_ms:
+                source_store = TelemetryStore() # Backfill history without rewinding live values.
+                forward_live = False
+            else:
+                self.latest_sample_time_ms = data['sample_time_ms']
+                with self.transport_lock:
+                    self.active_transport = transport
+        packet = source_store.update(data, now=now)
         if packet.get("config_ack"):
             with self.command_lock:
                 if int(packet["config_seq"]) == int(self.command_state["command_expected_seq"]):
@@ -1126,28 +1142,43 @@ class EVGateway:
                 )
                 self.relay_ping_baseline = None
                 self.relay_ping_deadline = 0.0
-        self._forward_snapshot(forward_live=forward_live)
+        self._forward_snapshot(forward_live=forward_live, pending=pending, source_store=source_store, transport=transport)
         return True
 
-    def _forward_snapshot(self, forward_live: bool = True, sample_time_ms: int | None = None) -> None:
+    def _forward_snapshot(self, forward_live: bool = True, sample_time_ms: int | None = None,
+                          pending: list | None = None, source_store: TelemetryStore | None = None,
+                          transport: str | None = None) -> None:
         # Archives keep capture-time validity, even after an internet outage.
         # Live widgets separately expire delayed samples instead of presenting
         # historical replay as a currently healthy vehicle.
-        snapshot = self.snapshot(include_delivery_delay=False)
+        snapshot = self.snapshot(include_delivery_delay=False, source_store=source_store)
+        if transport is not None:
+            snapshot["telemetry_transport"] = transport
         if sample_time_ms is not None:
             snapshot['sample_time_ms'] = sample_time_ms
-        self.tuning.append(snapshot)
-        self.battery.append(snapshot)
         if self.database is not None:
             self.database.record(snapshot)
+        if pending is not None:
+            pending.append((snapshot, forward_live))
+        else:
+            self._publish_snapshot(snapshot, forward_live)
+
+    def _publish_snapshot(self, snapshot: dict, forward_live: bool) -> None:
+        self.tuning.append(snapshot)
+        self.battery.append(snapshot)
         if not forward_live:
             return
         payload = json.dumps(self.snapshot(), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         with self.forward_lock:
-            self.forward_socket.sendto(payload, self.pit_target)
+            try:
+                self.forward_socket.sendto(payload, self.pit_target)
+            except OSError:
+                # Display forwarding must not reject an already committed batch.
+                pass
 
-    def snapshot(self, include_display_test: bool = False, include_delivery_delay: bool = True) -> dict[str, Any]:
-        result = self.store.snapshot(include_delivery_delay=include_delivery_delay)
+    def snapshot(self, include_display_test: bool = False, include_delivery_delay: bool = True,
+                 source_store: TelemetryStore | None = None) -> dict[str, Any]:
+        result = (source_store or self.store).snapshot(include_delivery_delay=include_delivery_delay)
         now = time.monotonic()
         with self.transport_lock:
             active_transport = self.active_transport
@@ -1247,23 +1278,37 @@ class EVGateway:
             return False
         return hmac.compare_digest(authorization.strip(), f"Bearer {self.relay_token}")
 
+    def telemetry_exchange(self, data: Mapping[str, Any], transport: str, vehicle_id: str = "EV") -> dict[str, Any]:
+        vehicle_id = re.sub(r"[^A-Za-z0-9_.-]", "", vehicle_id)[:32] or "EV"
+        with self.relay_ingest_lock:
+            key, samples, ack, clock = self.relay_samples.prepare(data, vehicle_id)
+            with self.transport_lock:
+                self.transport_last[transport] = time.monotonic()
+            pending = []
+            with self.database.batch() if self.database is not None and samples else nullcontext():
+                for i, sample in enumerate(samples):
+                    if transport == 'USB':
+                        sample['usb_dropped_samples'] = sample.pop('relay_dropped_samples')
+                        sample['usb_queue_samples'] = sample.pop('relay_queue_samples')
+                        sample['usb_queue_bytes'] = sample.pop('relay_queue_bytes')
+                        sample['usb_batch_samples'] = sample.pop('relay_batch_samples')
+                    self.accept(sample, transport=transport, forward_live=i == len(samples) - 1,
+                                pending=pending, tracked=True)
+            self.relay_samples.commit(key, ack, clock, [sample['seq'] for sample in samples])
+            for snapshot, forward_live in pending:
+                self._publish_snapshot(snapshot, forward_live)
+        return {'ack_seq': ack, 'accepted_samples': len(samples)}
+
     def relay_exchange(self, data: Mapping[str, Any], vehicle_id: str = "EV") -> dict[str, Any]:
         self.relay_vehicle_id = re.sub(r"[^A-Za-z0-9_.-]", "", vehicle_id)[:32] or "EV"
-        ack = None
-        accepted = 0
-        with self.relay_ingest_lock:
-            if 'samples' in data:
-                key, samples, ack, clock = self.relay_samples.prepare(data, self.relay_vehicle_id)
-                with self.database.batch() if self.database is not None and samples else nullcontext():
-                    for i, sample in enumerate(samples):
-                        accepted += int(self.accept(sample, transport='INTERNET_RELAY',
-                                                    forward_live=i == len(samples) - 1))
-                self.relay_samples.commit(key, ack, clock)
-            else:
-                telemetry = data.get("telemetry", data)
-                if not isinstance(telemetry, Mapping):
-                    raise ValueError("telemetry JSON object required")
-                accepted = int(self.accept(telemetry, transport="INTERNET_RELAY"))
+        if 'samples' in data:
+            result = self.telemetry_exchange(data, 'INTERNET_RELAY', self.relay_vehicle_id)
+            ack, accepted = result['ack_seq'], result['accepted_samples']
+        else:
+            telemetry = data.get("telemetry", data)
+            if not isinstance(telemetry, Mapping):
+                raise ValueError("telemetry JSON object required")
+            ack, accepted = None, int(self.accept(telemetry, transport="INTERNET_RELAY"))
         now = time.monotonic()
         with self.relay_lock:
             command = (
@@ -1543,7 +1588,7 @@ class EVGateway:
                         "pit_config", "live_tv", "relay_ping", "recording_start", "recording_stop"
                     }:
                         self.submit_control(decoded)
-                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError, sqlite3.Error):
                     continue
 
     def udp_loop(self) -> None:
@@ -1559,7 +1604,7 @@ class EVGateway:
                     decoded = json.loads(payload.decode("utf-8"))
                     if isinstance(decoded, dict):
                         self.accept(decoded, _sender, transport="WIFI_UDP")
-                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError, sqlite3.Error):
                     continue
 
     def rear_serial_loop(self, port: str, baud: int) -> None:
@@ -1589,23 +1634,54 @@ class EVGateway:
 
         while not self.stop_event.is_set():
             try:
-                with serial.Serial(port=port, baudrate=baud, timeout=0.25) as stream:
+                stream = serial.Serial(port=None, baudrate=baud, timeout=0.05, write_timeout=0.2)
+                stream.dtr = False
+                stream.rts = False
+                stream.port = port
+                stream.open()
+                with stream:
+                    schemas = {}
                     with self.serial_lock:
                         self.serial_stream = stream
-                    while not self.stop_event.is_set():
-                        line = stream.readline().strip()
-                        if not line or line.startswith(b"#"):
+                        stream.write(b'{"type":"usb_start"}\n')
+                    last_usb_data = time.monotonic()
+                    for line in usb_lines(stream, self.stop_event):
+                        if not line:
+                            if time.monotonic() - last_usb_data >= 2.0:
+                                with self.serial_lock:
+                                    stream.write(b'{"type":"usb_start"}\n')
+                                last_usb_data = time.monotonic()
                             continue
                         try:
-                            decoded = json.loads(line.decode("utf-8"))
-                            if isinstance(decoded, dict):
+                            decoded = decode_usb_line(line)
+                            if decoded is None:
+                                continue
+                            last_usb_data = time.monotonic()
+                            if 'samples' in decoded:
+                                if not isinstance(decoded.get('stream_id'), str) or not isinstance(decoded.get('vehicle_id', 'EV'), str):
+                                    raise ValueError('USB stream and vehicle IDs must be strings')
+                                key = (decoded.get('vehicle_id', 'EV'), decoded.get('stream_id'))
+                                columns = decoded.get('columns', schemas.get(key))
+                                if columns is None:
+                                    with self.serial_lock:
+                                        stream.write(b'{"type":"usb_start"}\n')
+                                    continue
+                                decoded['columns'] = columns
+                                result = self.telemetry_exchange(decoded, 'USB', str(decoded.get('vehicle_id', 'EV')))
+                                schemas = {key: columns}
+                                ack = {'type': 'usb_ack', 'stream_id': decoded['stream_id'], 'ack_seq': result['ack_seq']}
+                                with self.serial_lock:
+                                    stream.write((json.dumps(ack, separators=(',', ':')) + '\n').encode('ascii'))
+                            else:
                                 self.accept(decoded, transport="USB")
-                        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                        except (UnicodeDecodeError, ValueError, sqlite3.Error):
+                            # No ACK: corrupted or uncommitted samples stay on ESP.
                             continue
-            except serial.SerialException:
+            except (serial.SerialException, OSError):
+                self.stop_event.wait(1.0)
+            finally:
                 with self.serial_lock:
                     self.serial_stream = None
-                self.stop_event.wait(1.0)
 
     def bms_serial_loop(self, port: str, baud: int = 9600) -> None:
         """Merge a directly attached DALY BMS into the common wireless-ready packet."""
@@ -1812,6 +1888,10 @@ def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
                                        "input_port": snapshot["input_port"],
                                        "input_online": snapshot["usb_link_online"] if snapshot["input_mode"] in {"STM_USB", "ESP_USB"} else snapshot["online"],
                                        "receive_rate_hz": snapshot["receive_rate_hz"],
+                                       "telemetry_transport": snapshot["telemetry_transport"],
+                                       "usb_dropped_samples": snapshot.get('usb_dropped_samples', 0),
+                                       "usb_queue_samples": snapshot.get('usb_queue_samples', 0),
+                                       "usb_batch_samples": snapshot.get('usb_batch_samples', 0),
                                        "relay_dropped_samples": snapshot.get('relay_dropped_samples', 0),
                                        "relay_queue_samples": snapshot.get('relay_queue_samples', 0),
                                        "relay_batch_samples": snapshot.get('relay_batch_samples', 0),
@@ -2005,6 +2085,9 @@ def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
                     json.dumps({"ok": True, **result}, ensure_ascii=False).encode("utf-8"),
                     "application/json; charset=utf-8",
                 )
+            except sqlite3.Error:
+                self._send(b'{"ok":false,"error":"recording failed; retry batch"}',
+                           "application/json; charset=utf-8", HTTPStatus.SERVICE_UNAVAILABLE)
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 self._send(
                     json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"),
@@ -2034,9 +2117,9 @@ def main() -> int:
     parser.add_argument("--enable-control", action="store_true",
                         help="allow stationary PIT ENABLE configuration commands")
     serial_input = parser.add_mutually_exclusive_group()
-    serial_input.add_argument("--serial", metavar="PORT", help="read ESP32 JSON lines, e.g. COM8")
+    serial_input.add_argument("--serial", metavar="PORT", help="read ESP32 USB-UART batches, e.g. COM8; UDP/HTTPS remain available")
     serial_input.add_argument("--rear-serial", metavar="PORT", help="read-only Rear STM ST-Link text records, e.g. COM13")
-    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--baud", type=int, default=None, help="ESP USB-UART: 3000000; Rear STM USB: 115200")
     parser.add_argument("--front-serial", metavar="PORT",
                         help="merge Front STM CLI FRONT? data, e.g. COM11")
     parser.add_argument("--front-baud", type=int, default=115200)
@@ -2046,6 +2129,7 @@ def main() -> int:
     parser.add_argument("--database", default=str(PROJECT_ROOT / "data" / "ev_telemetry.db"),
                         help="SQLite database used by dashboard measurement sessions")
     args = parser.parse_args()
+    args.baud = args.baud or (USB_BAUD if args.serial else 115200)
     if args.rear_serial and args.enable_control:
         parser.error("Rear ST-Link USB input is read-only; --enable-control is not allowed")
     if args.rear_serial and args.rear_serial.upper() in {
@@ -2069,6 +2153,8 @@ def main() -> int:
         mode = f"UDP {args.listen_host}:{args.listen_port}"
     source_thread = threading.Thread(target=source, name="ev-source", daemon=True)
     source_thread.start()
+    if args.serial:
+        threading.Thread(target=gateway.udp_loop, name="ev-udp", daemon=True).start()
     if args.front_serial:
         front_thread = threading.Thread(
             target=lambda: gateway.front_serial_loop(args.front_serial, args.front_baud),

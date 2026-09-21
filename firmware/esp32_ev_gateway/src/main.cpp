@@ -18,6 +18,7 @@
 #include "rear_timing.h"
 #include "telemetry_queue.h"
 #include "telemetry_columns.h"
+#include "usb_telemetry.h"
 #if EV_RELAY_FAST_RSA_TLS
 #include "ngrok_tls_client.h"
 #endif
@@ -215,12 +216,15 @@ bool jsonStringEquals(const String& input, const char* key, const char* expected
     return end >= start && input.substring(start, end) == expected;
 }
 
+constexpr uint32_t kUsbBaud = 3000000u;
+UsbTelemetry usbTelemetry;
+char relayColumns[3072] = {};
+char relayStreamId[17] = {};
+
 #if EV_RELAY_ENABLED
 portMUX_TYPE relayMux = portMUX_INITIALIZER_UNLOCKED;
 // Variable-length rows share 96 KiB instead of reserving 4 KiB per sample.
 TelemetryQueue<1536, 256, 96 * 1024> relaySamples;
-char relayColumns[3072] = {};
-char relayStreamId[17] = {};
 constexpr size_t kRelayBatchSize = 64 * 1024;
 // Only the header is copied; HTTPClient streams frozen FIFO rows directly.
 char relayPrefix[4096] = {};
@@ -265,18 +269,6 @@ private:
     const char* prefix_;
     size_t prefixLength_, count_, arrayLength_, position_ = 0;
 };
-
-void stageRelayTelemetry(const char* json) {
-    static char columns[sizeof(relayColumns)], row[1536];
-    const bool valid = telemetryColumns(json, columns, sizeof(columns), row, sizeof(row));
-    portENTER_CRITICAL(&relayMux);
-    if (!valid || (relayColumns[0] && strcmp(relayColumns, columns))) relaySamples.reject();
-    else {
-        if (!relayColumns[0]) memcpy(relayColumns, columns, strlen(columns) + 1);
-        relaySamples.push(state.sequence, row);
-    }
-    portEXIT_CRITICAL(&relayMux);
-}
 
 void stageRelayCommand(const String& response) {
 #if EV_RELAY_ACCEPT_COMMANDS
@@ -325,8 +317,6 @@ void relayTask(void*) {
         relayAuthority = relayAuthority.substring(0, portMarker);
     }
 
-    snprintf(relayStreamId, sizeof(relayStreamId), "%08lx%08lx",
-             static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
     uint32_t retryMs = 1000;
     bool networkPathChecked = false;
     bool networkTimeRequested = false;
@@ -392,9 +382,6 @@ void relayTask(void*) {
             const int dnsOk = WiFi.hostByName(relayAuthority.c_str(), relayAddress) == 1 ? 1 : -1;
             int tcpOk = 0;
             if (dnsOk == 1) {
-                Serial.printf("# Relay resolved=%s epoch=%ld free_heap=%u\n",
-                              relayAddress.toString().c_str(), static_cast<long>(time(nullptr)),
-                              static_cast<unsigned>(ESP.getFreeHeap()));
                 WiFiClient tcpProbe;
                 tcpOk = tcpProbe.connect(relayAddress, relayPort, 5000) == 1 ? 1 : -1;
                 tcpProbe.stop();
@@ -480,6 +467,30 @@ void relayTask(void*) {
 }
 #endif
 
+void stageTelemetry(const char* json) {
+    static char columns[sizeof(relayColumns)], row[1536];
+    const bool valid = telemetryColumns(json, columns, sizeof(columns), row, sizeof(row));
+#if EV_RELAY_ENABLED
+    portENTER_CRITICAL(&relayMux);
+#endif
+    if (!valid || (relayColumns[0] && strcmp(relayColumns, columns))) {
+        usbTelemetry.reject();
+#if EV_RELAY_ENABLED
+        relaySamples.reject();
+#endif
+    }
+    else {
+        if (!relayColumns[0]) memcpy(relayColumns, columns, strlen(columns) + 1);
+        usbTelemetry.push(state.sequence, row);
+#if EV_RELAY_ENABLED
+        relaySamples.push(state.sequence, row);
+#endif
+    }
+#if EV_RELAY_ENABLED
+    portEXIT_CRITICAL(&relayMux);
+#endif
+}
+
 void setStatusLed(uint8_t red, uint8_t green, uint8_t blue) {
 #if EV_STATUS_LED_ENABLED
     neopixelWrite(EV_STATUS_LED_GPIO, red, green, blue);
@@ -503,15 +514,6 @@ void runStatusLedSelfTest() {
 }
 
 void maintainWifi() {
-    static uint32_t lastReport = 0;
-    const uint32_t reportNow = millis();
-    if (reportNow - lastReport >= 2000u) {
-        lastReport = reportNow;
-        Serial.printf("# WiFi status=%d ip=%s rssi=%ld reconnects=%lu\n",
-                      static_cast<int>(WiFi.status()), WiFi.localIP().toString().c_str(),
-                      WiFi.status() == WL_CONNECTED ? static_cast<long>(WiFi.RSSI()) : -127L,
-                      static_cast<unsigned long>(wifiReconnectAttempts));
-    }
     if (WiFi.status() == WL_CONNECTED) return;
     const uint32_t now = millis();
     if (now - wifiLastReconnectMs < 15000u) return;
@@ -1176,9 +1178,29 @@ void receiveCommands() {
         while (commandUdp.available()) input += static_cast<char>(commandUdp.read());
         if (trustedPit) handleCommand(input);
     }
-    if (Serial.available()) {
-        String input = Serial.readStringUntil('\n');
-        handleCommand(input);
+    // Commands/recording ACKs may be split across UART reads. Never wait for LF.
+    static char usbInput[512];
+    static size_t usbLength = 0;
+    static bool usbOverflow = false;
+    for (unsigned n = 0; n < 512 && Serial.available(); ++n) {
+        const char value = static_cast<char>(Serial.read());
+        if (value == '\n') {
+            usbInput[usbLength] = '\0';
+            if (!usbOverflow) {
+                const String input(usbInput);
+                if (jsonStringEquals(input, "type", "usb_start")) usbTelemetry.start();
+                else if (jsonStringEquals(input, "type", "usb_ack") &&
+                         jsonStringEquals(input, "stream_id", relayStreamId)) {
+                    const int key = input.indexOf("\"ack_seq\"");
+                    const int colon = key >= 0 ? input.indexOf(':', key) : -1;
+                    if (colon >= 0) usbTelemetry.acknowledge(strtoul(input.c_str() + colon + 1, nullptr, 10));
+                } else handleCommand(input);
+            }
+            usbLength = 0; usbOverflow = false;
+        } else if (value != '\r') {
+            if (usbLength + 1 < sizeof(usbInput)) usbInput[usbLength++] = value;
+            else usbOverflow = true;
+        }
     }
 #if EV_RELAY_ENABLED && EV_RELAY_ACCEPT_COMMANDS
     char pending[sizeof(relayCommand)] = {};
@@ -1283,7 +1305,7 @@ void publishTelemetry() {
         if (n < 0 || (size_t)n >= sizeof(sampleJson)) return;
     }
     int jsonLength = snprintf(json, sizeof(json),
-        "{\"rear_sample\":%s,\"board_timing\":%s,\"seq\":%lu,\"timestamp_ms\":%lu,\"rpm_left\":%u,\"rpm_right\":%u,"
+        "{\"stream_id\":\"%s\",\"vehicle_id\":\"%s\",\"rear_sample\":%s,\"board_timing\":%s,\"seq\":%lu,\"timestamp_ms\":%lu,\"rpm_left\":%u,\"rpm_right\":%u,"
         "\"rpm_left_reported\":%u,\"rpm_right_reported\":%u,\"rpm_left_reported_online\":%s,\"rpm_right_reported_online\":%s,"
         "\"rpm_left_quality\":\"%s\",\"rpm_right_quality\":\"%s\","
         "\"cap_left\":%lu,\"cap_right\":%lu,\"rpm_glitch_left\":%lu,\"rpm_glitch_right\":%lu,"
@@ -1309,7 +1331,7 @@ void publishTelemetry() {
         "\"internet_relay_tx\":%lu,\"internet_relay_errors\":%lu,\"internet_relay_commands\":%lu,"
         "\"internet_relay_last_http_status\":%d,\"internet_relay_dns_ok\":%d,"
         "\"internet_relay_tcp443_ok\":%d,\"internet_relay_tls_error\":%d}",
-        sampleJson,timingJson,static_cast<unsigned long>(state.sequence), static_cast<unsigned long>(millis()),
+        relayStreamId,EV_VEHICLE_ID,sampleJson,timingJson,static_cast<unsigned long>(state.sequence), static_cast<unsigned long>(millis()),
         state.rpmLeft, state.rpmRight,
         state.rpmLeft, state.rpmRight, rearFresh ? "true" : "false", rearFresh ? "true" : "false",
         rpmLeftQuality, rpmRightQuality,
@@ -1412,15 +1434,7 @@ void publishTelemetry() {
             }
         }
     }
-#if EV_RELAY_ENABLED
-    stageRelayTelemetry(json);
-#endif
-    // Queue USB debug at 1 Hz; never block UART reception for a 3 KB JSON.
-    static uint32_t lastUsbMs = 0;
-    if (millis() - lastUsbMs >= 1000u && Serial.availableForWrite() >= jsonLength + 2) {
-        Serial.println(json);
-        lastUsbMs = millis();
-    }
+    stageTelemetry(json);
     state.configAck = false;
 }
 
@@ -1428,7 +1442,9 @@ void publishTelemetry() {
 
 void setup() {
     Serial.setTxBufferSize(4096);
-    Serial.begin(115200);
+    Serial.begin(kUsbBaud);
+    snprintf(relayStreamId, sizeof(relayStreamId), "%08lx%08lx",
+             static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
     Serial.setTimeout(10);
     Serial.println("# DJY ESP gateway boot");
     runStatusLedSelfTest();
@@ -1487,5 +1503,7 @@ void loop() {
     maintainWifi();
     updateStatusLed();
     publishTelemetry();
+    for (unsigned i = 0; i < 4; ++i)
+        usbTelemetry.poll(Serial, millis(), relayColumns, relayStreamId, EV_VEHICLE_ID);
     delay(1);
 }

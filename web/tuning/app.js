@@ -168,7 +168,7 @@ function drawPlot(group,view,cursorRow){
 async function sessions(){const data=await json(api+'/sessions');const selected=$('session').value;$('session').replaceChildren(new Option('과거 측정 선택',''));for(const s of data.sessions)$('session').add(new Option(`#${s.id} · ${s.label||'측정'} · ${new Date(s.started_at_utc).toLocaleString('ko-KR')} · ${s.sample_count}개`,s.id));$('session').value=selected;}
 async function history(page=0){
   const generation=++state.generation;clearSelection();state.busyHistory=true;$('prev').disabled=$('next').disabled=true;
-  try{const data=await json(`${api}/samples?session_id=${state.session}&after=${state.pages[page]||0}&through=${state.through}`);if(generation!==state.generation)return;state.history=data.samples;state.through=data.through;state.page=page;state.pages[page+1]=data.cursor;state.more=data.more;$('scrub').value=1000;$('mode').textContent=`과거 세션 #${state.session} · ${page+1}페이지 · ${data.samples.length}개`;$('error').textContent='';draw();}
+  try{const data=await json(`${api}/samples?session_id=${state.session}&after=${state.pages[page]||0}&through=${state.through}`);if(generation!==state.generation)return;state.history=data.samples.sort((a,b)=>a.time_ms-b.time_ms||a.id-b.id);state.through=data.through;state.page=page;state.pages[page+1]=data.cursor;state.more=data.more;$('scrub').value=1000;$('mode').textContent=`과거 세션 #${state.session} · ${page+1}페이지 · ${data.samples.length}개`;$('error').textContent='';draw();}
   catch(e){$('error').textContent=e.message;}finally{if(generation===state.generation){state.busyHistory=false;navigation();}}
 }
 function navigation(){$('export').textContent=state.mode==='history'?'세션 전체 CSV 저장':'최근 버퍼 CSV 저장';$('prev').disabled=state.mode!=='history'||state.busyHistory||state.page===0;$('next').disabled=state.mode!=='history'||state.busyHistory||!state.more;$('pause').disabled=state.mode!=='live';}
@@ -183,21 +183,24 @@ async function poll(){
     // Pause only freezes the view. Every fetched sample still enters the
     // buffer, and a multi-page response is drained without render throttling.
     for(const sample of data.samples)state.live.push(sample);
+    state.live.sort((a,b)=>a.time_ms-b.time_ms||a.id-b.id);
     if(!data.more&&Object.values(data.current).every(v=>v===null))state.live.push({id:0,time_ms:data.now_ms,values:data.current,status:data.current_status});
     state.live=state.live.slice(-12000);
     catchUp=data.more;
-    if(data.relay_dropped_samples>0)$('notice').textContent=`차량 전송 버퍼 초과: ${data.relay_dropped_samples}개 표본 누락. 통신 상태를 확인하세요.`;
+    const usbBatch=data.telemetry_transport==='USB'&&data.input_mode==='ESP_USB';
+    const dropped=usbBatch?data.usb_dropped_samples:data.relay_dropped_samples;
+    if(dropped>0)$('notice').textContent=`${usbBatch?'USB':'차량'} 전송 버퍼 초과: ${dropped}개 표본 누락. 통신 상태를 확인하세요.`;
     const rear=data.rear_sample,bms=data.bms_power_timing;
-    $('delivery').textContent=`수신 ${format(data.receive_rate_hz,1)} 표본/s · 최근 묶음 ${data.relay_batch_samples||0}개 · 전송 시 대기 ${data.relay_queue_samples||0}개 · 최신 표본 전송 대기 ${format(data.sample_age_at_receive_ms||0,0)} ms · ESP 누락 ${data.relay_dropped_samples||0}개`+
+    $('delivery').textContent=`수신 ${format(data.receive_rate_hz,1)} 표본/s · ${usbBatch?'USB':'무선'} 묶음 ${(usbBatch?data.usb_batch_samples:data.relay_batch_samples)||0}개 · 전송 시 대기 ${(usbBatch?data.usb_queue_samples:data.relay_queue_samples)||0}개 · 최신 표본 전송 대기 ${format(data.sample_age_at_receive_ms||0,0)} ms · 버퍼 누락 ${dropped||0}개`+
       (Array.isArray(rear)?` · STM 송신 누락 ${rear[4]} / UART 누락 ${rear[5]}`:'')+
       (Array.isArray(bms)?` · BMS 응답 ${bms[3]}개 / 최근 간격 ${bms[5]} ms / 최대 ${bms[6]} ms`:'');
     RecordingClock.update(data);state.recording=data.recording_active;$('recordStatus').textContent=data.recording_active?`● 기록 중 · 세션 #${data.recording_session_id} · ${data.recording_sample_count}개`:'기록 대기 · 측정 시작부터 DB에 저장';
     if(data.recording_error)$('recordStatus').textContent=data.recording_error;
     else if(data.recording_active&&(!data.recording_last_received_at_utc||data.now_ms-Date.parse(data.recording_last_received_at_utc)>3000))$('recordStatus').textContent+=' · 수신 대기';
     $('record').textContent=data.recording_active?'측정 종료':'측정 시작';$('record').disabled=!data.can_record;$('label').disabled=data.recording_active||!data.can_record;$('rawLink').hidden=false;
-    const wired=data.input_mode==='STM_USB';
-    $('link').textContent=wired?(data.input_online?`● STM USB ${data.input_port} · ${format(data.receive_rate_hz,1)} Hz 수신`:`○ STM USB ${data.input_port} · 미수신`):(Object.values(data.current).some(finite)?'● 실측 신호 수신 중':'○ 게이트웨이 연결됨 · 센서 미수신');
-    $('signalStatus').textContent=wired?(data.input_online?data.signal_warning:'USB 수신 중단 · 마지막 값은 현재값으로 표시하지 않습니다.') : '';
+    const wired=['STM_USB','ESP_USB'].includes(data.input_mode),board=data.input_mode==='ESP_USB'?'ESP':'STM';
+    $('link').textContent=wired?(data.input_online?`● ${board} USB ${data.input_port} · ${format(data.receive_rate_hz,1)} Hz 수신`:`○ ${board} USB ${data.input_port} · 미수신`):(Object.values(data.current).some(finite)?'● 실측 신호 수신 중':'○ 게이트웨이 연결됨 · 센서 미수신');
+    $('signalStatus').textContent=wired?(data.input_online?(data.signal_warning||''):'USB 수신 중단 · 마지막 값은 현재값으로 표시하지 않습니다.') : '';
     draw();
   }catch(e){$('link').textContent='게이트웨이 연결 끊김';$('signalStatus').textContent='';$('error').textContent=e.message;$('record').disabled=true;state.current={};state.currentStatus={};if(state.mode==='live'&&!state.paused)draw();}
   finally{setTimeout(poll,catchUp?0:100);}

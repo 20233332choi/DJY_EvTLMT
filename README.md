@@ -7,7 +7,8 @@ STM·ESP·BMS·휴대폰 GPS 데이터를 수신하고 저장하는 웹 텔레�
 `start_telemetry.bat`을 실행하면 텔레메트리 서버와 ngrok을 시작하고 브라우저를 엽니다.
 현재 PC에 설정된 Python·ngrok 및 ESP 릴레이 설정을 사용합니다.
 실행 BAT는 `start_telemetry.bat` 하나만 사용합니다. 실행 시 프로젝트 경로를 표시하며, 다른 폴더의 서버가 실행 중이면 혼용하지 않고 중단합니다.
-USB 직접 수신은 PowerShell에서 `./scripts/run_ev_stack.ps1 -Wired -RearPort COM13`, BMS 벤치 연결은 `./scripts/run_bms_pit_dashboard.ps1 -Port COM5`를 사용합니다. 포트는 실제 연결에 맞춥니다.
+ESP USB 전체 표본 수신은 `start_telemetry.bat -EspPort COM8` 또는 `python gateway/ev_gateway.py --serial COM8`로 시작합니다(3000000 baud). [USB 전송·기록 안내](docs/USB_RECORDING_KO.md)를 참고하세요.
+후방 STM USB 진단 수신은 PowerShell에서 `./scripts/run_ev_stack.ps1 -Wired -RearPort COM13`, BMS 벤치 연결은 `./scripts/run_bms_pit_dashboard.ps1 -Port COM5`를 사용합니다. 포트는 실제 연결에 맞춥니다.
 
 | 화면 | 주소 |
 |---|---|

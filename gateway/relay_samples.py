@@ -1,6 +1,7 @@
 """Validate and de-duplicate FIFO telemetry batches; retain the vehicle clock."""
 from collections import OrderedDict
 from collections.abc import Mapping
+from bisect import bisect_right
 import re
 import time
 
@@ -18,6 +19,9 @@ class RelaySamples:
     """Caller serializes prepare/accept/commit with its ingest lock."""
     def __init__(self):
         self.streams = OrderedDict()
+        # Compact intervals retain exact identities, including holes filled by
+        # a slower USB/HTTPS path. A high-water mark would discard those holes.
+        self.received = {}
 
     def prepare(self, data, vehicle_id, now_ms=None):
         stream_id = data.get('stream_id')
@@ -50,8 +54,9 @@ class RelaySamples:
             ack, clock_sent, clock_ms = previous
         advance = (sent - clock_sent) & 0xffffffff
         if advance > 0x7fffffff:
-            raise ValueError('batch clock moved backwards')
+            advance -= 0x100000000
         batch_ms = clock_ms + advance
+        ranges = self.received.get(key, [])
         rows = []
         last_seq = 0
         last_elapsed = 0x100000000
@@ -64,7 +69,8 @@ class RelaySamples:
             if seq <= last_seq or elapsed > last_elapsed or elapsed > 86400000:
                 raise ValueError('samples must be ordered and no older than one day')
             last_seq, last_elapsed = seq, elapsed
-            if seq <= ack:
+            index = bisect_right(ranges, (seq, 0xffffffff)) - 1
+            if index >= 0 and ranges[index][1] >= seq:
                 continue
             row = dict(sample)
             row.update(sample_time_ms=round(batch_ms - elapsed),
@@ -73,10 +79,22 @@ class RelaySamples:
                        relay_queue_samples=queued, relay_queue_bytes=queue_bytes,
                        relay_batch_samples=len(samples))
             rows.append(row)
-        return key, rows, max(ack, last_seq), (sent, batch_ms)
+        # ACK exactly this batch, not a newer sequence received on another link.
+        clock = (sent, batch_ms) if advance >= 0 else (clock_sent, clock_ms)
+        return key, rows, last_seq, clock
 
-    def commit(self, key, ack, clock):
-        self.streams[key] = (ack, *clock)
+    def commit(self, key, ack, clock, sequences=None):
+        previous_ack = self.streams.get(key, (0,))[0]
+        additions = ([(previous_ack + 1, ack)] if ack > previous_ack else []) if sequences is None else [(s, s) for s in sequences]
+        merged = []
+        for start, end in sorted(self.received.get(key, []) + additions):
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        self.received[key] = merged
+        self.streams[key] = (max(previous_ack, ack), *clock)
         self.streams.move_to_end(key)
         while len(self.streams) > 8:
-            self.streams.popitem(last=False)
+            oldest, _ = self.streams.popitem(last=False)
+            self.received.pop(oldest, None)

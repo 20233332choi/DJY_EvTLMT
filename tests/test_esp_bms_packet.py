@@ -130,7 +130,7 @@ int main() {
             result = subprocess.run([str(exe)], capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
 
-    def test_complete_bms_datagram(self):
+    def format_datagram_rows(self):
         source = (ROOT / "firmware/esp32_ev_gateway/src/main.cpp").read_text(encoding="utf-8")
         state = source[source.index("struct VehicleState {"):source.index("} bms;") + len("} bms;")]
         helpers = source[source.index("float throttlePercent()"):source.index("bool pitAllowed()")]
@@ -146,11 +146,13 @@ int main() {
 #define EV_REAR_UART_MODE 1
 #define EV_RECEIVE_ONLY 1
 #define EV_RELAY_ENABLED 0
+#define EV_VEHICLE_ID "EV"
 #define WL_CONNECTED 3
 #define PI 3.14159265358979323846
 template<class T> T constrain(T x,T lo,T hi) { return x<lo?lo:x>hi?hi:x; }
 uint32_t clockMs=1000000;
 bool rearSamplePending=false,bmsSamplePending=false;
+const char relayStreamId[]="0123456789abcdef";
 uint32_t millis() { return clockMs; }
 uint32_t wifiReconnectAttempts=0;
 constexpr uint16_t kSasCounts=16384, kSasCenterRaw=8192;
@@ -204,7 +206,10 @@ int main() {
             result = subprocess.run(compiler(True)+["-std=c++11", "-I", str(ROOT / "firmware/esp32_ev_gateway/include"), str(cpp), "-o", str(exe)], capture_output=True, timeout=180)
             self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
             result = subprocess.run([str(exe)], check=True, capture_output=True, timeout=10)
-        rows = result.stdout.splitlines()
+        return result.stdout.splitlines()
+
+    def test_complete_bms_datagram(self):
+        rows = self.format_datagram_rows()
         self.assertEqual(len(rows), 9, "ESP dropped telemetry while formatting BMS fields")
         schemas = [json.loads(rows[i]) for i in (1,4,7)]
         self.assertEqual(schemas[0], schemas[1])

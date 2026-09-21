@@ -10,7 +10,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 class QueueTests(unittest.TestCase):
     def test_fifo_retries_overflow_and_partial_ack(self):
         firmware = (ROOT/'firmware/esp32_ev_gateway/src/main.cpp').read_text()
-        body = firmware[firmware.index('class RelayBody :'):firmware.index('void stageRelayTelemetry(')]
+        body = firmware[firmware.index('class RelayBody :'):firmware.index('void stageRelayCommand(')]
         source = r'''
 #include "telemetry_queue.h"
 #include <cassert>
