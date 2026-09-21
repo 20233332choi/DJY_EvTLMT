@@ -9,7 +9,7 @@
 
 후방 제어 주기는 기존 100 Hz를 유지하고 UART1 송신만 238바이트 CRC16 바이너리/460800 baud/최대 100 Hz로 변경했습니다. USART2 USB ASCII 진단은 115200 baud/최대 5 Hz입니다. ESP와 후방을 함께 업데이트해야 합니다.
 
-저장소 루트에서 `./scripts/build_stm32_rear_uart.ps1 -BinaryRear`를 실행합니다. 출력은 `.local/stm32-rear-binary/`입니다. 스크립트의 기존 기본 빌드 대상은 과거 프로젝트로 유지하며, `-LegacyPinned`와 `-BinaryRear`는 동시에 사용할 수 없습니다. 이 프로젝트 자체를 STM32CubeIDE로 열어 빌드할 수도 있습니다.
+저장소 루트에서 `./scripts/build_stm32_rear_uart.ps1 -BinaryRear`를 실행합니다. 시간 동기화 전방 `firmware/stm32_front_synced`도 함께 빌드하며 출력은 `.local/stm32-rear-binary/`입니다. 스크립트의 기존 기본 빌드 대상은 과거 프로젝트로 유지하며, `-LegacyPinned`와 `-BinaryRear`는 동시에 사용할 수 없습니다. 이 프로젝트 자체를 STM32CubeIDE로 열어 빌드할 수도 있습니다.
 
 이 PR의 원본 반입 커밋과 다음 기능 변경 커밋을 나눠 보면, 실차 제공본 대비 바뀐 후방 파일은 `main.c`, `timing_diag.c/.h`, `stm_back.ioc`, 새 `djy_telemetry_protocol.h` 5개입니다. IMU·안전·TV/ED·DAC의 원본 제어 코드는 유지했습니다. 제공본의 SD 디스크 I/O는 미구현 상태이므로 SD 기록 성공을 의미하지 않습니다.
 

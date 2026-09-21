@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from host_compiler import compiler
 
-PROJECT = Path(os.environ.get('DJY_STM_PROJECT', str(Path.home()/'Documents/TV/stm_back')))
+PROJECT = Path(os.environ.get('DJY_STM_PROJECT', str(Path(__file__).resolve().parents[1]/'firmware/stm32_rear_binary')))
 
 class VehicleFrameTests(unittest.TestCase):
     def test_flu_sensor_and_corrective_torque(self):

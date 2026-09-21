@@ -27,7 +27,8 @@ Copy-Item -Path (Join-Path $overlay 'Src\*') -Destination (Join-Path $repoRoot '
 } else {
     $firmware = Join-Path $repoRoot 'firmware'
     New-Item -ItemType Directory -Force -Path $firmware | Out-Null
-    Copy-Item -LiteralPath (Join-Path $evRoot 'firmware\tv_stm_esp\stm_front') -Destination (Join-Path $firmware 'front') -Recurse
+    $frontProject = if ($BinaryRear) { 'firmware\stm32_front_synced' } else { 'firmware\tv_stm_esp\stm_front' }
+    Copy-Item -LiteralPath (Join-Path $evRoot $frontProject) -Destination (Join-Path $firmware 'front') -Recurse
     $rearProject = if ($BinaryRear) { 'firmware\stm32_rear_binary' } else { 'firmware\tv_stm_esp\stm_back' }
     Copy-Item -LiteralPath (Join-Path $evRoot $rearProject) -Destination (Join-Path $firmware 'rear') -Recurse
 }
