@@ -14,7 +14,7 @@ if ($Wired) {
         $ports = @(python -c "import serial.tools.list_ports; print('\n'.join(p.device for p in serial.tools.list_ports.comports() if p.vid == 0x0483))")
         $ports = @($ports | Where-Object { $_ -match '^COM\d+$' })
         if ($ports.Count -ne 1) {
-            throw 'Connect Rear ST-Link USB, or specify: run_dashboard.bat wired COM13 (use the actual Rear port).'
+            throw 'Connect Rear ST-Link USB, or run scripts/run_ev_stack.ps1 -Wired -RearPort COM13 (use the actual Rear port).'
         }
         $RearPort = $ports[0]
     }

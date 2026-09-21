@@ -2,6 +2,16 @@ param([switch]$OpenDashboard, [switch]$InternetOnly)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+$gateway = Join-Path $root 'gateway\ev_gateway.py'
+Write-Host "Telemetry project: $root"
+# Do not silently reuse a server launched from another project copy.
+$listeners = @(Get-NetTCPConnection -LocalPort 8766 -State Listen -ErrorAction SilentlyContinue)
+foreach ($listener in $listeners) {
+    $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)"
+    if (-not $owner -or $owner.CommandLine -notlike "*$gateway*") {
+        throw 'Port 8766 belongs to another project or application. Stop that server before starting this project.'
+    }
+}
 $toolRoot = Join-Path $env:USERPROFILE 'telemetry-tools'
 $python = Join-Path $toolRoot 'python\python.exe'
 $ngrok = Join-Path $toolRoot 'ngrok\ngrok.exe'
@@ -57,6 +67,6 @@ if (-not $tunnel) {
         '--log', ('"{0}"' -f (Join-Path $toolRoot 'ngrok\agent.log')))
 }
 Write-Host 'PC dashboard: http://127.0.0.1:8766/pit'
-Write-Host "Internet dashboard (read-only): $publicUrl/pit"
+Write-Host "Internet dashboard: $publicUrl/pit"
 Write-Host 'Vehicle commands require the local pit controls; public control requests are refused.'
 if ($OpenDashboard) { Start-Process 'http://127.0.0.1:8766/pit' }

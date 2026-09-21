@@ -7,7 +7,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $gateway = Join-Path $projectRoot 'gateway\ev_gateway.py'
-$dashboard = Join-Path $projectRoot 'run_dashboard.bat'
 
 & python.exe -c 'import serial'
 if ($LASTEXITCODE -ne 0) {
@@ -34,7 +33,7 @@ if (-not $ready) {
 }
 
 if (-not $SkipDashboard) {
-    Start-Process -FilePath $dashboard -WorkingDirectory $projectRoot -ArgumentList 'ev'
+    Start-Process 'http://127.0.0.1:8766/pit'
 }
 Write-Host "DALY BMS: LIVE on $Port at 9600 bps"
 Write-Host 'HTML pit dashboard: http://127.0.0.1:8766/pit'

@@ -8,7 +8,6 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $gateway = Join-Path $projectRoot 'gateway\ev_gateway.py'
-$dashboard = Join-Path $projectRoot 'run_dashboard.bat'
 $config = Join-Path $projectRoot 'firmware\esp32_ev_gateway\include\config.h'
 $ngrokScript = Join-Path $PSScriptRoot 'start_ev_ngrok.ps1'
 
