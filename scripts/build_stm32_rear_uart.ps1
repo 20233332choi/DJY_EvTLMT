@@ -1,14 +1,16 @@
 param(
     [string]$SourceRepository = (Join-Path $PSScriptRoot '..\..\DJY_TQV'),
-    [switch]$LegacyPinned
+    [switch]$LegacyPinned,
+    [switch]$BinaryRear
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($LegacyPinned -and $BinaryRear) { throw 'Choose LegacyPinned or BinaryRear, not both' }
 
 $evRoot = Split-Path -Parent $PSScriptRoot
 $revision = 'ee9d295bae733b27dc93f7dd4871d38d284e9732'
-$artifacts = Join-Path $evRoot $(if ($LegacyPinned) { '.local\stm32-rear-uart' } else { '.local\tv-stm-esp' })
+$artifacts = Join-Path $evRoot $(if ($BinaryRear) { '.local\stm32-rear-binary' } elseif ($LegacyPinned) { '.local\stm32-rear-uart' } else { '.local\tv-stm-esp' })
 $repoRoot = Join-Path ([IO.Path]::GetTempPath()) ("DJY_EvTLMT-stm32-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $repoRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $artifacts | Out-Null
@@ -26,7 +28,8 @@ Copy-Item -Path (Join-Path $overlay 'Src\*') -Destination (Join-Path $repoRoot '
     $firmware = Join-Path $repoRoot 'firmware'
     New-Item -ItemType Directory -Force -Path $firmware | Out-Null
     Copy-Item -LiteralPath (Join-Path $evRoot 'firmware\tv_stm_esp\stm_front') -Destination (Join-Path $firmware 'front') -Recurse
-    Copy-Item -LiteralPath (Join-Path $evRoot 'firmware\tv_stm_esp\stm_back') -Destination (Join-Path $firmware 'rear') -Recurse
+    $rearProject = if ($BinaryRear) { 'firmware\stm32_rear_binary' } else { 'firmware\tv_stm_esp\stm_back' }
+    Copy-Item -LiteralPath (Join-Path $evRoot $rearProject) -Destination (Join-Path $firmware 'rear') -Recurse
 }
 $toolBin = Join-Path $env:USERPROFILE '.platformio\packages\toolchain-gccarmnoneeabi\bin'
 $gcc = Join-Path $toolBin 'arm-none-eabi-gcc.exe'

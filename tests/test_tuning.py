@@ -2,6 +2,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -11,9 +12,46 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'gateway'))
 from ev_gateway import EVGateway, TelemetryDatabase, TelemetryStore, make_handler
 from tuning import CHANNELS, TuningStream, project, rpm_status
+from battery import CHANNELS as BATTERY_CHANNELS, project as battery_project, status as battery_status
 
 
 class TuningTests(unittest.TestCase):
+    def test_battery_samples_keep_times_missing_values_and_expiry(self):
+        store, stream = TelemetryStore(), TuningStream(projector=battery_project, status_projector=battery_status)
+        for n in range(40):
+            store.update({'seq': n+1, 'sample_time_ms': 1000+n*5,
+                          'battery_pack_voltage_v': 52+n*.01, 'battery_current_a': 0,
+                          'bms_online': True, 'bms_temp_min_c': 25, 'private': 'hidden'}, now=10+n*.005)
+            stream.append(store.snapshot(now=10+n*.005))
+        rows = stream.read()['samples']
+        self.assertEqual([r['time_ms'] for r in rows], list(range(1000, 1200, 5)))
+        self.assertEqual(rows[-1]['values']['battery_current_a'], 0)
+        self.assertEqual(rows[-1]['values']['bms_temp_min_c'], 25)
+        self.assertIsNone(rows[-1]['values']['battery_soc_pct'])
+        self.assertIsNone(rows[-1]['values']['bms_temp_max_c'])
+        self.assertNotIn('private', json.dumps(rows))
+        self.assertNotIn('bms_temp_min_c', project(store.snapshot(now=10.195)))
+        self.assertTrue(all(v is None for v in battery_project(store.snapshot(now=14)).values()))
+
+    def test_direct_bms_projection_uses_its_own_values_and_clock(self):
+        gateway = EVGateway('127.0.0.1', 0, '127.0.0.1', 19004)
+        try:
+            gateway.store.update({'sample_time_ms': 100, 'battery_soc_pct': 10,
+                                 'bms_power_timing': [1, 1, 0, 1, -1, 10, 10, 10]})
+            gateway.bms_configured = True
+            gateway.bms_last_monotonic = time.monotonic()
+            gateway.bms_state = {'battery_soc_pct': 80, 'battery_current_a': 0, 'bms_temp_min_c': 24}
+            gateway._forward_snapshot(forward_live=False, sample_time_ms=200)
+            row = gateway.battery.read()['samples'][-1]
+            self.assertEqual(row['time_ms'], 200)
+            self.assertEqual(row['values']['battery_soc_pct'], 80)
+            self.assertEqual(row['values']['battery_current_a'], 0)
+            self.assertIsNone(row['values']['battery_pack_voltage_v'])
+            gateway.bms_last_monotonic -= 4
+            self.assertTrue(all(v is None for v in battery_project(gateway.snapshot()).values()))
+        finally:
+            gateway.forward_socket.close()
+
     def test_pid_and_controller_channels_preserve_zero_and_expire(self):
         store = TelemetryStore()
         data = {'vehicle_speed_m_s': 12, 'speed_kmh': 43.2, 'speed_online': True,
@@ -140,6 +178,13 @@ class TuningTests(unittest.TestCase):
                 self.assertEqual(live['current']['yaw_rate_rad_s'], .2)
                 self.assertNotIn('database_path', live)
                 self.assertEqual(len(live['channels']), len(CHANNELS))
+                gateway.accept({'seq': 11, 'bms_online': True, 'battery_pack_voltage_v': 53,
+                                'battery_soc_pct': 75, 'bms_temp_min_c': 22})
+                battery = json.loads(get('/api/battery/live', True))
+                self.assertEqual(len(battery['channels']), len(BATTERY_CHANNELS))
+                self.assertEqual(battery['current']['battery_soc_pct'], 75)
+                self.assertEqual(battery['samples'][-1]['values']['bms_temp_min_c'], 22)
+                self.assertNotIn('rpm_left', battery['current'])
                 self.assertEqual(live['current_status']['rpm_right_quality'], 'NO_DATA')
                 self.assertIn('피트 대시보드', get('/pit', True).decode())
                 sessions = json.loads(get('/api/tuning/sessions', True))['sessions']

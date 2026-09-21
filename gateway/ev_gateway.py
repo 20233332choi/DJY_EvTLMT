@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
+from contextlib import contextmanager, nullcontext
 import hmac
 import json
 import math
@@ -705,7 +708,8 @@ class TelemetryDatabase:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._batching = False
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA synchronous=NORMAL")
@@ -833,12 +837,16 @@ class TelemetryDatabase:
             return self._status_locked()
 
     def record(self, packet: Mapping[str, Any]) -> None:
-        try:
-            self._record_packet(packet)
-        except sqlite3.Error as exc:
-            with self._lock:
+        with self._lock:
+            previous = (self._sample_count, self._last_received_epoch)
+            try:
+                self._record_packet(packet)
+            except sqlite3.Error as exc:
                 self._connection.rollback()
+                self._sample_count, self._last_received_epoch = previous
                 self.recording_error = 'DB 저장 실패: ' + type(exc).__name__
+                if self._batching:
+                    raise
 
     def _record_packet(self, packet: Mapping[str, Any]) -> None:
         with self._lock:
@@ -886,14 +894,38 @@ class TelemetryDatabase:
             )
             self._connection.execute('UPDATE telemetry_samples SET received_at_utc=? WHERE id=?',
                                      (self._utc_text(received), cursor.lastrowid))
-            self._connection.execute(
-                "UPDATE measurement_sessions SET sample_count=? WHERE id=?",
-                (self._sample_count + 1, self._session_id),
-            )
-            self._connection.commit()
             self._sample_count += 1
             self._last_received_epoch = received
             self.recording_error = ''
+            if self._batching:
+                return
+            self._connection.execute(
+                "UPDATE measurement_sessions SET sample_count=? WHERE id=?",
+                (self._sample_count, self._session_id),
+            )
+            self._connection.commit()
+
+    @contextmanager
+    def batch(self):
+        """Commit one SQLite transaction per HTTP batch before acknowledging it."""
+        with self._lock:
+            previous_count = self._sample_count
+            previous_received = self._last_received_epoch
+            self._batching = True
+            try:
+                yield
+                if self._session_id is not None:
+                    self._connection.execute(
+                        "UPDATE measurement_sessions SET sample_count=? WHERE id=?",
+                        (self._sample_count, self._session_id))
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                self._sample_count = previous_count
+                self._last_received_epoch = previous_received
+                raise
+            finally:
+                self._batching = False
 
     def _status_locked(self) -> dict[str, Any]:
         return {
@@ -973,7 +1005,7 @@ class TelemetryDatabase:
             self._connection.close()
 
     def tuning_samples(self, session_id: int, after: int = 0, through: int = 0,
-                       limit: int = 1000, projector=tuning_project, status_projector=rpm_status) -> dict[str, Any]:
+                       limit: int = 1000, projector=tuning_project, status_projector=rpm_status, include_raw: bool = False) -> dict[str, Any]:
         """Keyset pages frozen at through; recording cannot shift history pages."""
         with self._lock:
             if not through:
@@ -987,10 +1019,11 @@ class TelemetryDatabase:
                 (session_id, after, through, max(1, min(1000, limit))),
             ).fetchall()
         from datetime import datetime
-        samples = [{"id": row[0],
+        samples = [{"id": row[0], "captured_at_utc": row[1],
                     "time_ms": round(datetime.fromisoformat(row[1].replace("Z", "+00:00")).timestamp() * 1000),
                     "source_timestamp_ms": row[2], "values": projector(json.loads(row[3])),
-                    "status": status_projector(json.loads(row[3]))}
+                    "status": status_projector(json.loads(row[3])),
+                    **({"telemetry": json.loads(row[3])} if include_raw else {})}
                    for row in rows]
         return {"samples": samples, "through": through,
                 "cursor": samples[-1]["id"] if samples else after,
@@ -1072,7 +1105,7 @@ class EVGateway:
             return False
 
     def accept(self, data: Mapping[str, Any], sender: tuple[str, int] | None = None,
-               transport: str = "WIFI_UDP") -> bool:
+               transport: str = "WIFI_UDP", forward_live: bool = True) -> bool:
         now = time.monotonic()
         if sender is not None and transport == "WIFI_UDP":
             self.latest_udp_sender = sender
@@ -1093,18 +1126,22 @@ class EVGateway:
                 )
                 self.relay_ping_baseline = None
                 self.relay_ping_deadline = 0.0
-        self._forward_snapshot()
+        self._forward_snapshot(forward_live=forward_live)
         return True
 
-    def _forward_snapshot(self) -> None:
+    def _forward_snapshot(self, forward_live: bool = True, sample_time_ms: int | None = None) -> None:
         # Archives keep capture-time validity, even after an internet outage.
         # Live widgets separately expire delayed samples instead of presenting
         # historical replay as a currently healthy vehicle.
         snapshot = self.snapshot(include_delivery_delay=False)
+        if sample_time_ms is not None:
+            snapshot['sample_time_ms'] = sample_time_ms
         self.tuning.append(snapshot)
         self.battery.append(snapshot)
         if self.database is not None:
             self.database.record(snapshot)
+        if not forward_live:
+            return
         payload = json.dumps(self.snapshot(), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         with self.forward_lock:
             self.forward_socket.sendto(payload, self.pit_target)
@@ -1156,6 +1193,8 @@ class EVGateway:
             bms_state["bms_age_ms"] = 0.0 if bms_age is None else round(bms_age * 1000.0, 1)
             bms_state["bms_ok"] = bms_state["bms_online"] and not bool(bms_state.get("bms_fault"))
             result.update(bms_state)
+            # Direct UART BMS measurements supersede wireless diagnostics.
+            result.pop('bms_power_timing', None)
             electrical = with_power(bms_state)
             result.update({key: electrical[key] for key in ('battery_power_w', 'battery_power_kw') if key in electrical})
             result['_tuning_values'].update({key: electrical.get(key) for key in BATTERY_INPUTS})
@@ -1215,8 +1254,10 @@ class EVGateway:
         with self.relay_ingest_lock:
             if 'samples' in data:
                 key, samples, ack, clock = self.relay_samples.prepare(data, self.relay_vehicle_id)
-                for sample in samples:
-                    accepted += int(self.accept(sample, transport='INTERNET_RELAY'))
+                with self.database.batch() if self.database is not None and samples else nullcontext():
+                    for i, sample in enumerate(samples):
+                        accepted += int(self.accept(sample, transport='INTERNET_RELAY',
+                                                    forward_live=i == len(samples) - 1))
                 self.relay_samples.commit(key, ack, clock)
             else:
                 telemetry = data.get("telemetry", data)
@@ -1608,13 +1649,13 @@ class EVGateway:
                             with self.bms_lock:
                                 self.bms_state = packet
                                 self.bms_last_monotonic = time.monotonic()
-                            self._forward_snapshot()
+                            self._forward_snapshot(sample_time_ms=time.time_ns() // 1000000)
                         self.stop_event.wait(0.25)
             except (serial.SerialException, OSError):
                 with self.bms_lock:
                     self.bms_last_monotonic = None
                     self.bms_state.update({"bms_online": False, "bms_ok": False})
-                self._forward_snapshot()
+                self._forward_snapshot(sample_time_ms=time.time_ns() // 1000000)
                 self.stop_event.wait(1.0)
 
 def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
@@ -1695,6 +1736,63 @@ def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
                 return
             # Team sharing exposes measured channels only; raw records and
             # command/recording writes retain their existing local-only guard.
+            if path in {"/api/recording/export", "/api/tuning/export", "/api/battery/export"}:
+                raw_export = path == "/api/recording/export"
+                if raw_export and not is_local_http_request(self.client_address[0], self.headers):
+                    self._send(b"local pit client required", "text/plain", HTTPStatus.FORBIDDEN)
+                    return
+                if gateway.database is None:
+                    self._send(b"database disabled", "text/plain", HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
+                query = parse_qs(parsed.query)
+                try:
+                    sid = int(query.get('session_id', ['0'])[0])
+                    through = int(query.get('through', ['0'])[0])
+                    if sid <= 0 or through < 0: raise ValueError('invalid session or cursor')
+                    kind = query.get('format', ['jsonl' if raw_export else 'csv'])[0]
+                    if kind not in (('jsonl', 'csv') if raw_export else ('csv',)): raise ValueError('invalid format')
+                except ValueError as exc:
+                    self._send(str(exc).encode(), 'text/plain', HTTPStatus.BAD_REQUEST)
+                    return
+                battery_export = path == '/api/battery/export'
+                projector = battery_project if battery_export else tuning_project
+                status_projector = battery_status if battery_export else rpm_status
+                page = gateway.database.tuning_samples(sid, through=through, projector=projector, status_projector=status_projector, include_raw=raw_export)
+                self.send_response(HTTPStatus.OK)
+                self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8' if kind == 'jsonl' else 'text/csv; charset=utf-8')
+                self.send_header('Content-Disposition', f'attachment; filename="ev-session-{sid}-full.{kind}"')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.close_connection = True
+                keys = [c[0] for c in (BATTERY_CHANNELS if battery_export else CHANNELS)]
+                status_keys = ['rpm_left_quality', 'rpm_right_quality', 'rpm_left_rejected_pct',
+                               'rpm_right_rejected_pct', 'motor_command_mode']
+                if battery_export:
+                    status_keys = list(battery_status({}))
+                output = io.StringIO()
+                writer = csv.writer(output)
+                try:
+                    if kind == 'csv':
+                        writer.writerow(['id', 'captured_at_utc', 'source_timestamp_ms', *keys, *status_keys, *(['payload_json'] if raw_export else [])])
+                        self.wfile.write(('\ufeff' + output.getvalue()).encode('utf-8'))
+                        output.seek(0); output.truncate()
+                    while True:
+                        for sample in page['samples']:
+                            raw = json.dumps(sample.get('telemetry', {}), ensure_ascii=False, separators=(',', ':'))
+                            if kind == 'jsonl':
+                                output.write(json.dumps({'id': sample['id'], 'captured_at_utc': sample['captured_at_utc'],
+                                                         'telemetry': sample['telemetry']}, ensure_ascii=False, separators=(',', ':')) + '\n')
+                            else:
+                                writer.writerow([sample['id'], sample['captured_at_utc'], sample['source_timestamp_ms'],
+                                                 *[sample['values'].get(k) for k in keys],
+                                                 *[sample['status'].get(k) for k in status_keys], *([raw] if raw_export else [])])
+                        self.wfile.write(output.getvalue().encode('utf-8'))
+                        output.seek(0); output.truncate()
+                        if not page['more']: break
+                        page = gateway.database.tuning_samples(sid, page['cursor'], page['through'], projector=projector, status_projector=status_projector, include_raw=raw_export)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             if path.startswith(("/api/tuning/", "/api/battery/")):
                 try:
                     is_battery = path.startswith('/api/battery/')
@@ -1715,6 +1813,11 @@ def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
                                        "input_online": snapshot["usb_link_online"] if snapshot["input_mode"] in {"STM_USB", "ESP_USB"} else snapshot["online"],
                                        "receive_rate_hz": snapshot["receive_rate_hz"],
                                        "relay_dropped_samples": snapshot.get('relay_dropped_samples', 0),
+                                       "relay_queue_samples": snapshot.get('relay_queue_samples', 0),
+                                       "relay_batch_samples": snapshot.get('relay_batch_samples', 0),
+                                       "sample_age_at_receive_ms": snapshot.get('sample_age_at_receive_ms', 0),
+                                       "rear_sample": snapshot.get('rear_sample'),
+                                       "bms_power_timing": snapshot.get('bms_power_timing'),
                                        "signal_warning": str(snapshot.get("signal_warning", ""))[:240],
                                        "recording_active": snapshot["recording_active"],
                                        "recording_session_id": snapshot["recording_session_id"],
@@ -1768,6 +1871,7 @@ def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
             if path in {
                 "/api/recording/status",
                 "/api/recording/sessions", "/api/recording/samples",
+                "/api/recording/export",
             } and not is_local_http_request(self.client_address[0], self.headers):
                 self._send(b"local pit client required", "text/plain", HTTPStatus.FORBIDDEN)
                 return
@@ -1803,8 +1907,12 @@ def make_handler(gateway: EVGateway) -> type[BaseHTTPRequestHandler]:
                     offset = int(query.get("offset", ["0"])[0])
                     if session_id <= 0:
                         raise ValueError("session_id must be positive")
+                    result = (gateway.database.tuning_samples(session_id,
+                              max(0, int(query.get('after', ['0'])[0])),
+                              max(0, int(query.get('through', ['0'])[0])), limit, include_raw=True)
+                              if 'after' in query else gateway.database.list_samples(session_id, limit, offset))
                     body = json.dumps(
-                        gateway.database.list_samples(session_id, limit, offset),
+                        result,
                         ensure_ascii=False,
                     ).encode("utf-8")
                     self._send(body, "application/json; charset=utf-8")

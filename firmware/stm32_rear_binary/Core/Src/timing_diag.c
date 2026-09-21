@@ -67,27 +67,23 @@ void Timing_ControlEnd(uint32_t started) {
     uint32_t duration=VehicleClock_Us32()-started;
     TimingStat_Add(&stats[EXEC],duration);if(duration>=10000u)overruns++;
 }
-int Timing_FormatRelay(char *destination,size_t capacity) {
+bool Timing_ReadRelay(uint32_t fields[19]) {
     static unsigned metric;
-    if(!measuring)return 0;
+    if(!measuring){memset(fields,0,19u*sizeof(*fields));return false;}
     uint32_t mask=__get_PRIMASK();__disable_irq();
     uint64_t clock=VehicleClock_NowUs();
     BoardTimeSyncStatus sy=BoardTimeSync_Status((uint32_t)clock);
     TimingStat stat=stats[metric];SensorTiming_t input=CAN_GetSensorTiming();
     uint32_t seq=control_seq,fm=front_unmapped,fn=front_negative,ov=overruns;
     __set_PRIMASK(mask);
-    // Versioned diagnostic extension, same field order as ESP RearTiming.
-    int n=snprintf(destination,capacity,
-      " ts=1/%lu/%u/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%ld/%u/%u/%lu/%lu/%lu/%lu/%lu",
-      (unsigned long)seq,metric,(unsigned long)stat.n,
-      (unsigned long)(stat.n?stat.min:UINT32_MAX),
-      (unsigned long)(stat.n?stat.sum/stat.n:UINT32_MAX),
-      (unsigned long)TimingStat_P95(&stat),(unsigned long)(stat.n?stat.max:UINT32_MAX),
-      (unsigned long)sy.valid,(unsigned long)sy.rtt_us,(unsigned long)sy.bound_us,(long)sy.drift_ppm,
-      (unsigned)input.timestamped,(unsigned)input.span_us,(unsigned long)fm,(unsigned long)fn,
-      (unsigned long)ov,(unsigned long)(clock>>32),(unsigned long)clock);
-    if(n<=0 || (size_t)n>=capacity)return 0;
-    metric=(metric+1)%METRICS;return n;
+    // Same 19 fields/scales as the old ts= extension; drift word is signed.
+    uint32_t next[19]={1u,seq,metric,stat.n,
+      stat.n?stat.min:UINT32_MAX,stat.n?(uint32_t)(stat.sum/stat.n):UINT32_MAX,
+      TimingStat_P95(&stat),stat.n?stat.max:UINT32_MAX,
+      sy.valid,sy.rtt_us,sy.bound_us,(uint32_t)sy.drift_ppm,
+      input.timestamped,input.span_us,fm,fn,ov,(uint32_t)(clock>>32),(uint32_t)clock};
+    memcpy(fields,next,sizeof(next));
+    metric=(metric+1)%METRICS;return true;
 }
 void Timing_Publish(void) {
     static uint32_t previous;

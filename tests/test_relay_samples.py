@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'gateway'))
-from relay_samples import RelaySamples
+from relay_samples import RelaySamples, MAX_BATCH_SAMPLES
 from ev_gateway import EVGateway
 
 
@@ -56,7 +56,7 @@ class RelaySampleTests(unittest.TestCase):
             if mutation == 'duplicate': data['samples'][3]['seq'] = 1
             if mutation == 'backwards_time': data['samples'][3]['timestamp_ms'] = 0
             if mutation == 'future': data['samples'][3]['timestamp_ms'] = 1001
-            if mutation == 'too_many': data['samples'].append(data['samples'][-1])
+            if mutation == 'too_many': data['samples'] *= MAX_BATCH_SAMPLES
             if mutation == 'bool_seq': data['samples'][0]['seq'] = True
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 r.prepare(data, 'EV', 100000)
@@ -99,6 +99,31 @@ class RelaySampleTests(unittest.TestCase):
         data = batch(); data['samples'][-1] = None
         with self.assertRaises(ValueError): gateway.relay_exchange(data)
         self.assertEqual(gateway.tuning.read()['samples'], [])
+
+    def test_columnar_64_samples_preserve_all_values_and_reject_bad_schema(self):
+        data=batch(count=64, sent=1000)
+        for i,row in enumerate(data['samples']):
+            row.update(timestamp_ms=100+i*10, rear_sample=[1,i,0,i*10000,0,0,0,0],
+                       bms_cell_voltages_v=[3.14,4.2], private='exact \\" string')
+        original=copy.deepcopy(data['samples'])
+        data['columns']=list(original[0])
+        data['samples']=[list(row.values()) for row in original]
+        receiver=RelaySamples()
+        key,rows,ack,clock=receiver.prepare(data,'EV',100000)
+        self.assertEqual(ack,64)
+        for source,row in zip(original,rows):
+            self.assertEqual({k:row[k] for k in source},source)
+        self.assertEqual([rows[i+1]['sample_time_ms']-rows[i]['sample_time_ms'] for i in range(63)], [10]*63)
+        receiver.commit(key,ack,clock)
+        self.assertEqual(receiver.prepare(data,'EV',100100)[1],[])
+        for broken in ('short_row','duplicate_key','missing_timestamp','oversized'):
+            invalid=copy.deepcopy(data)
+            if broken=='short_row': invalid['samples'][-1].pop()
+            if broken=='duplicate_key': invalid['columns'][-1]=invalid['columns'][0]
+            if broken=='missing_timestamp': invalid['columns'][1]='other'
+            if broken=='oversized': invalid['samples'].append(invalid['samples'][-1])
+            with self.subTest(broken=broken),self.assertRaises(ValueError):
+                RelaySamples().prepare(invalid,'EV')
 
 
 if __name__ == '__main__': unittest.main()

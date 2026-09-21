@@ -6,7 +6,7 @@
 #include <errno.h>
 
 // ts= has 19 integer fields. Only drift (11) is signed; all others are uint32.
-// Keep this compact for the existing telemetry queue and 115200 baud UART.
+// Keep this compact for the existing telemetry queue; legacy ts= remains readable.
 class RearTiming {
 public:
     bool valid=false;
@@ -38,6 +38,7 @@ public:
             if(n<0 || (size_t)n>=size-used)return false;
             used+=(size_t)n;
         }
-        if(size-used<2)return false;out[used++]=']';out[used]='\0';return true;
+        if(size-used<2)return false;
+        out[used++]=']';out[used]='\0';return true;
     }
 };

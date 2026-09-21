@@ -4,8 +4,8 @@ from collections.abc import Mapping
 import re
 import time
 
-MAX_BATCH_SAMPLES = 4
-MAX_BATCH_BYTES = 4 * 4096 + 1024
+MAX_BATCH_SAMPLES = 64
+MAX_BATCH_BYTES = 64 * 1024
 
 
 def _uint(value, name, minimum=0):
@@ -25,9 +25,20 @@ class RelaySamples:
             raise ValueError('16 digit stream_id required')
         samples = data.get('samples')
         if not isinstance(samples, list) or not 1 <= len(samples) <= MAX_BATCH_SAMPLES:
-            raise ValueError('batch requires 1..4 samples')
+            raise ValueError(f'batch requires 1..{MAX_BATCH_SAMPLES} samples')
+        columns = data.get('columns')
+        if columns is not None:
+            if (not isinstance(columns, list) or not 1 <= len(columns) <= 256
+                    or any(not isinstance(k, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,79}', k) for k in columns)
+                    or len(set(columns)) != len(columns)
+                    or not {'seq', 'timestamp_ms'}.issubset(columns)
+                    or any(not isinstance(row, list) or len(row) != len(columns) for row in samples)):
+                raise ValueError('invalid columns or row length')
+            samples = [dict(zip(columns, row)) for row in samples]
         sent = _uint(data.get('sent_ms'), 'sent_ms')
         dropped = _uint(data.get('dropped_samples', 0), 'dropped_samples')
+        queued = _uint(data.get('queue_samples', len(samples)), 'queue_samples')
+        queue_bytes = _uint(data.get('queue_bytes', 0), 'queue_bytes')
         now_ms = time.time_ns() / 1e6 if now_ms is None else now_ms
         key = (vehicle_id, stream_id)
         previous = self.streams.get(key)
@@ -58,7 +69,9 @@ class RelaySamples:
             row = dict(sample)
             row.update(sample_time_ms=round(batch_ms - elapsed),
                        sample_age_at_receive_ms=elapsed,
-                       relay_stream_id=stream_id, relay_dropped_samples=dropped)
+                       relay_stream_id=stream_id, relay_dropped_samples=dropped,
+                       relay_queue_samples=queued, relay_queue_bytes=queue_bytes,
+                       relay_batch_samples=len(samples))
             rows.append(row)
         return key, rows, max(ack, last_seq), (sent, batch_ms)
 

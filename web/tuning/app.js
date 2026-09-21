@@ -5,15 +5,19 @@ const api = batteryPage ? '/api/battery' : '/api/tuning';
 const channelStorage = batteryPage ? 'ev-battery-channels-v1' : 'ev-tuning-channels-v2';
 const colors = ['#00ffff','#ffff00','#00ff00','#ff3333','#ff00ff','#ffffff'];
 const groups = batteryPage ? window.batteryDashboard.groups : {yaw:'01 · Yaw 제어 / 목표·실제·STM 오차',power:'02 · 출력 배분 / 좌·우·차동전력',rpm:'03 · 모터 RPM / 측정·보고·목표',speed:'04 · 차량 속도',steering:'05 · 조향 입력',throttle:'06 · 스로틀 입력',traction:'07 · 트랙션 개입 배율',activity:'08 · TV / ED 개입 상태',voltage:'09 · 모터 전압'};
+if(!batteryPage)Object.assign(groups,{battery_voltage:'10 · 배터리 팩 전압',battery_current:'11 · 배터리 전류',battery_power:'12 · 배터리 실측 전력',acceleration:'13 · 횡·종가속도'});
 const groupTitle = group => groups[group] || (group==='readouts'?'W / kW':group==='settings'?'PID 보드 보고값':'STM 차속 원본');
 const color = c => colors[state.channels.filter(x=>x.group===c.group).indexOf(c)%colors.length];
 const rpmQualities = {OK:'펄스 품질 통과 · 실회전수 보정은 별도',NOISY:'노이즈 의심 · 실제 회전수로 사용 불가',NO_PULSES:'새 펄스 없음 · 정지/단선 구분 불가',UNVERIFIED:'펄스 품질 확인 중',NO_DATA:'현재 수신값 없음'};
 const rpmStatusKeys = ['rpm_left_quality','rpm_right_quality','rpm_left_rejected_pct','rpm_right_rejected_pct','motor_command_mode'];
 const state = {channels:[],enabled:new Set(),live:[],history:[],mode:'live',paused:false,cursor:0,epoch:'',now:0,recording:false,session:0,through:0,pages:[0],page:0,more:false,busyHistory:false,generation:0,hover:null,track:[],lastFix:''};
 state.pausedRows = null;
+state.pausedEnd = null;
+state.lockedSample = null;
+state.plotView = null;
 const finite = x => typeof x === 'number' && Number.isFinite(x);
 const format = (v,d=3) => finite(v)?v.toFixed(d):'미수신';
-const time = t => new Date(t).toLocaleTimeString('ko-KR',{hour12:false})+'.'+String(Math.floor(t)%1000).padStart(3,'0');
+const time = t => new Date(t).toLocaleTimeString('en-GB',{hour12:false})+'.'+String(Math.floor(t)%1000).padStart(3,'0');
 async function json(url,options={}) {
   const response=await fetch(url,{cache:'no-store',signal:AbortSignal.timeout(8000),...options});
   if(!response.ok) throw new Error(`요청 실패 (${response.status})`);
@@ -42,30 +46,54 @@ function init(channels) {
     const section=document.createElement('section');section.className='plot';section.id='plot-'+group;
     const heading=document.createElement('h2');heading.textContent=title;
     const legend=document.createElement('div');legend.className='legend';
-    channels.filter(c=>c.group===group).forEach(c=>{const label=document.createElement('span');label.style.color=color(c);label.textContent=c.label;legend.append(label);});
+    channels.filter(c=>c.group===group).forEach(c=>{
+      const label=document.createElement('span');label.style.color=color(c);label.textContent=c.label;
+      const value=document.createElement('b');value.id='plot-value-'+c.key;label.append(value);legend.append(label);
+    });
+    const stamp=document.createElement('small');stamp.id='plot-time-'+group;stamp.className='plot-time';
     const canvas=document.createElement('canvas');canvas.id='canvas-'+group;canvas.setAttribute('role','img');canvas.setAttribute('aria-label',title+' 시간 그래프');
-    section.append(heading,legend,canvas);$('plots').append(section);
-    canvas.onpointermove=e=>{const rect=canvas.getBoundingClientRect();state.hover=Math.max(0,Math.min(1,(e.clientX-rect.left-72)/(rect.width-88)));draw();};
+    section.append(heading,stamp,legend,canvas);$('plots').append(section);
+    const pointTime=e=>{const rect=canvas.getBoundingClientRect(),view=state.plotView||viewport();const fraction=Math.max(0,Math.min(1,(e.clientX-rect.left-72)/(rect.width-88)));return view.start+(view.end-view.start)*fraction;};
+    canvas.onpointermove=e=>{if(state.lockedSample!==null)return;state.hover=pointTime(e);draw();};
     canvas.onpointerleave=()=>{state.hover=null;draw();};
+    canvas.onclick=e=>{
+      if(e.button!==0)return;
+      const row=nearest((state.plotView||viewport()).rows,pointTime(e));
+      if(!row)return;
+      // Keep the selected sample even after it leaves the moving live buffer.
+      state.lockedSample=row;state.hover=null;draw();
+    };
   }
 }
 function viewport(){
   const rows=state.mode==='live'?(state.pausedRows||state.live):state.history;
   const first=rows[0]?.time_ms??state.now;
-  const last=state.mode==='live'&&!state.paused?state.now:(rows.at(-1)?.time_ms??state.now);
+  const last=state.mode==='live'?(state.paused?(state.pausedEnd??state.now):state.now):(rows.at(-1)?.time_ms??state.now);
   const duration=$('window').value==='all'?Math.max(1000,last-first):Number($('window').value)*1000;
   const endMax=Math.max(last,first+1000);
   const end=Math.min(endMax,first+duration)+Math.max(0,endMax-first-duration)*Number($('scrub').value)/1000;
   const start=$('window').value==='all'?first:end-duration;
   return {rows:rows.filter(r=>r.time_ms>=start&&r.time_ms<=end),start,end:Math.max(start+1000,end)};
 }
+function nearest(rows,stamp){return rows.reduce((a,b)=>!a||Math.abs(b.time_ms-stamp)<Math.abs(a.time_ms-stamp)?b:a,null);}
+function clearSelection(){state.hover=null;state.lockedSample=null;}
+function pauseView(){
+  if(!state.paused){state.pausedRows=state.live.slice();state.pausedEnd=state.now;state.paused=true;}
+  $('pause').textContent='실시간 재개';
+}
 function surface(canvas){const r=canvas.getBoundingClientRect(),dpr=devicePixelRatio||1;canvas.width=Math.round(r.width*dpr);canvas.height=Math.round(r.height*dpr);const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);return {ctx,w:r.width,h:r.height};}
 function draw(){
   if(!state.channels.length)return;
-  const view=viewport();let selected=view.rows.at(-1),values=selected?.values||{},status=selected?.status||{};
-  if(state.hover!==null&&view.rows.length){const stamp=view.start+(view.end-view.start)*state.hover;const row=view.rows.reduce((a,b)=>Math.abs(b.time_ms-stamp)<Math.abs(a.time_ms-stamp)?b:a);selected=row;values=row.values;status=row.status||{};$('cursor').textContent=time(row.time_ms)+' · '+state.channels.filter(c=>state.enabled.has(c.key)).map(c=>`${c.label} ${format(values[c.key])} ${c.unit}`).join(' / ');}
-  else $('cursor').textContent=`${time(view.start)} → ${time(view.end)} · ${view.rows.filter(r=>r.id).length}개 · 포인터로 동시점 비교`;
-  const showingCurrent=state.mode==='live'&&!state.paused&&state.hover===null&&Number($('scrub').value)===1000;
+  const view=viewport();state.plotView=view;
+  const cursorRow=state.lockedSample||(state.hover===null?null:nearest(view.rows,state.hover));
+  const selected=cursorRow||view.rows.at(-1);
+  let values=selected?.values||{},status=selected?.status||{};
+  const locked=state.lockedSample!==null;
+  const outside=cursorRow&&(cursorRow.time_ms<view.start||cursorRow.time_ms>view.end);
+  $('cursorTime').textContent=cursorRow?`${locked?'값 고정':'선택'} ${time(cursorRow.time_ms)}`:`${time(view.start)} → ${time(view.end)} · ${view.rows.filter(r=>r.id).length}개`;
+  $('cursorHint').textContent=locked?`${outside?'선택 시점은 표시 구간 밖 · ':''}다른 지점 클릭: 값 변경 · 실시간 보기: 해제`:state.paused?'화면 정지 · 그래프를 클릭해 값을 선택하세요.':'마우스: 값 확인 · 좌클릭: 표시값 고정';
+  if(state.mode==='live')$('mode').textContent=state.paused?'화면 정지 · 표본 수집 중':`실시간${locked?' · 표시값 고정':''} · 버퍼 ${state.live.filter(r=>r.id).length}점`;
+  const showingCurrent=state.mode==='live'&&!state.paused&&!locked&&state.hover===null&&Number($('scrub').value)===1000;
   if(showingCurrent){values=state.current||{};status=state.currentStatus||{};}
   state.channels.forEach(c=>$('value-'+c.key).textContent=!finite(values[c.key])&&c.key.endsWith('_target')?'목표값 미제공':format(values[c.key])+' '+c.unit);
   if(batteryPage){window.batteryDashboard.render(values,status,view,selected,showingCurrent);}
@@ -97,9 +125,16 @@ function draw(){
   $('pidNote').textContent=gains.every(k=>finite(values[k]))?'STM 전송 설정값 · 읽기 전용':'PID 미수신 · PID 전송 지원 Rear 펌웨어 필요 (무선은 ESP도 필요)';
   }
   state.channels.forEach(c=>$('range-'+c.key).textContent=groups[c.group]?(state.enabled.has(c.key)?groupTitle(c.group):'그래프 숨김'):'수신값 표시 / CSV 기록');
-  for(const group of Object.keys(groups))drawPlot(group,view);
+  for(const group of Object.keys(groups)){
+    $('plot-time-'+group).textContent=showingCurrent?'현재 수신값 · 클릭하면 표시값 고정':`${locked?'값 고정':'선택'} ${selected?time(selected.time_ms):'기록 없음'}`;
+    for(const c of state.channels.filter(c=>c.group===group)){
+      const label=$('plot-value-'+c.key);label.parentElement.hidden=!state.enabled.has(c.key);
+      label.textContent=finite(values[c.key])?`${format(values[c.key],group==='rpm'?0:3)} ${c.unit}`:c.key.endsWith('_target')?'미제공':'미수신';
+    }
+    drawPlot(group,view,cursorRow);
+  }
 }
-function drawPlot(group,view){
+function drawPlot(group,view,cursorRow){
   const channels=state.channels.filter(c=>c.group===group&&state.enabled.has(c.key));
   let min=Infinity,max=-Infinity;
   for(const row of view.rows)for(const c of channels){const v=row.values[c.key];if(finite(v)){min=Math.min(min,v);max=Math.max(max,v);}}
@@ -125,15 +160,18 @@ function drawPlot(group,view){
     if(view.rows.length<150)for(const r of view.rows){const v=r.values[c.key];if(finite(v)){ctx.beginPath();ctx.arc(x(r.time_ms),y(v),2.5,0,Math.PI*2);ctx.fill();}}
   }
   if(!hasValues||!channels.length){ctx.fillStyle='#ffff00';ctx.textAlign='center';ctx.fillText(channels.length?'유효한 수신값 없음':'표시 신호 없음',w/2,h/2);}
-  if(state.hover!==null){ctx.strokeStyle='#ffffff';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(left+(right-left)*state.hover,top);ctx.lineTo(left+(right-left)*state.hover,bottom);ctx.stroke();ctx.setLineDash([]);}
+  if(cursorRow&&cursorRow.time_ms>=view.start&&cursorRow.time_ms<=view.end){
+    const xx=x(cursorRow.time_ms);ctx.strokeStyle='#ffffff';ctx.lineWidth=1;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(xx,top);ctx.lineTo(xx,bottom);ctx.stroke();ctx.setLineDash([]);
+    for(const c of channels){const value=cursorRow.values[c.key];if(!finite(value))continue;ctx.fillStyle=color(c);ctx.strokeStyle='#000000';ctx.lineWidth=2;ctx.beginPath();ctx.arc(xx,y(value),4,0,Math.PI*2);ctx.fill();ctx.stroke();}
+  }
 }
 async function sessions(){const data=await json(api+'/sessions');const selected=$('session').value;$('session').replaceChildren(new Option('과거 측정 선택',''));for(const s of data.sessions)$('session').add(new Option(`#${s.id} · ${s.label||'측정'} · ${new Date(s.started_at_utc).toLocaleString('ko-KR')} · ${s.sample_count}개`,s.id));$('session').value=selected;}
 async function history(page=0){
-  const generation=++state.generation;state.busyHistory=true;$('prev').disabled=$('next').disabled=true;
+  const generation=++state.generation;clearSelection();state.busyHistory=true;$('prev').disabled=$('next').disabled=true;
   try{const data=await json(`${api}/samples?session_id=${state.session}&after=${state.pages[page]||0}&through=${state.through}`);if(generation!==state.generation)return;state.history=data.samples;state.through=data.through;state.page=page;state.pages[page+1]=data.cursor;state.more=data.more;$('scrub').value=1000;$('mode').textContent=`과거 세션 #${state.session} · ${page+1}페이지 · ${data.samples.length}개`;$('error').textContent='';draw();}
   catch(e){$('error').textContent=e.message;}finally{if(generation===state.generation){state.busyHistory=false;navigation();}}
 }
-function navigation(){$('prev').disabled=state.mode!=='history'||state.busyHistory||state.page===0;$('next').disabled=state.mode!=='history'||state.busyHistory||!state.more;$('pause').disabled=state.mode!=='live';}
+function navigation(){$('export').textContent=state.mode==='history'?'세션 전체 CSV 저장':'최근 버퍼 CSV 저장';$('prev').disabled=state.mode!=='history'||state.busyHistory||state.page===0;$('next').disabled=state.mode!=='history'||state.busyHistory||!state.more;$('pause').disabled=state.mode!=='live';}
 async function poll(){
   let catchUp=false;
   try{
@@ -144,11 +182,15 @@ async function poll(){
     if(data.truncated)$('notice').textContent='실시간 버퍼를 벗어난 구간이 있습니다. 저장한 측정 세션에서 확인하세요.';
     // Pause only freezes the view. Every fetched sample still enters the
     // buffer, and a multi-page response is drained without render throttling.
-    state.live.push(...data.samples);
+    for(const sample of data.samples)state.live.push(sample);
     if(!data.more&&Object.values(data.current).every(v=>v===null))state.live.push({id:0,time_ms:data.now_ms,values:data.current,status:data.current_status});
     state.live=state.live.slice(-12000);
     catchUp=data.more;
     if(data.relay_dropped_samples>0)$('notice').textContent=`차량 전송 버퍼 초과: ${data.relay_dropped_samples}개 표본 누락. 통신 상태를 확인하세요.`;
+    const rear=data.rear_sample,bms=data.bms_power_timing;
+    $('delivery').textContent=`수신 ${format(data.receive_rate_hz,1)} 표본/s · 최근 묶음 ${data.relay_batch_samples||0}개 · 전송 시 대기 ${data.relay_queue_samples||0}개 · 최신 표본 전송 대기 ${format(data.sample_age_at_receive_ms||0,0)} ms · ESP 누락 ${data.relay_dropped_samples||0}개`+
+      (Array.isArray(rear)?` · STM 송신 누락 ${rear[4]} / UART 누락 ${rear[5]}`:'')+
+      (Array.isArray(bms)?` · BMS 응답 ${bms[3]}개 / 최근 간격 ${bms[5]} ms / 최대 ${bms[6]} ms`:'');
     RecordingClock.update(data);state.recording=data.recording_active;$('recordStatus').textContent=data.recording_active?`● 기록 중 · 세션 #${data.recording_session_id} · ${data.recording_sample_count}개`:'기록 대기 · 측정 시작부터 DB에 저장';
     if(data.recording_error)$('recordStatus').textContent=data.recording_error;
     else if(data.recording_active&&(!data.recording_last_received_at_utc||data.now_ms-Date.parse(data.recording_last_received_at_utc)>3000))$('recordStatus').textContent+=' · 수신 대기';
@@ -156,18 +198,18 @@ async function poll(){
     const wired=data.input_mode==='STM_USB';
     $('link').textContent=wired?(data.input_online?`● STM USB ${data.input_port} · ${format(data.receive_rate_hz,1)} Hz 수신`:`○ STM USB ${data.input_port} · 미수신`):(Object.values(data.current).some(finite)?'● 실측 신호 수신 중':'○ 게이트웨이 연결됨 · 센서 미수신');
     $('signalStatus').textContent=wired?(data.input_online?data.signal_warning:'USB 수신 중단 · 마지막 값은 현재값으로 표시하지 않습니다.') : '';
-    if(state.mode==='live')$('mode').textContent=state.paused?'화면 정지 · 표본 수집은 계속됨':`실시간 · 버퍼 ${state.live.filter(r=>r.id).length}점`;
     draw();
   }catch(e){$('link').textContent='게이트웨이 연결 끊김';$('signalStatus').textContent='';$('error').textContent=e.message;$('record').disabled=true;state.current={};state.currentStatus={};if(state.mode==='live'&&!state.paused)draw();}
-  finally{setTimeout(poll,catchUp?0:250);}
+  finally{setTimeout(poll,catchUp?0:100);}
 }
 $('record').onclick=async()=>{const active=state.recording;$('record').disabled=true;try{await json('/api/records/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:active?'stop':'start',label:$('label').value})});await sessions();$('error').textContent='';}catch(e){$('error').textContent=e.message;}};
-$('session').onchange=()=>{if(!$('session').value)return;state.mode='history';state.session=Number($('session').value);state.pages=[0];state.through=0;state.history=[];navigation();history();};
-$('live').onclick=()=>{state.generation++;state.mode='live';state.paused=false;state.pausedRows=null;state.busyHistory=false;$('pause').textContent='화면 일시정지';$('scrub').value=1000;$('session').value='';navigation();draw();};
-$('pause').onclick=()=>{state.paused=!state.paused;state.pausedRows=state.paused?state.live.slice():null;$('pause').textContent=state.paused?'실시간 재개':'화면 일시정지';$('scrub').value=1000;draw();};
+$('session').onchange=()=>{if(!$('session').value)return;clearSelection();state.mode='history';state.session=Number($('session').value);state.pages=[0];state.through=0;state.history=[];navigation();history();};
+$('live').onclick=()=>{state.generation++;clearSelection();state.mode='live';state.paused=false;state.pausedRows=null;state.pausedEnd=null;state.busyHistory=false;$('pause').textContent='화면 일시정지';$('scrub').value=1000;$('session').value='';navigation();draw();};
+$('pause').onclick=()=>{clearSelection();if(state.paused){state.paused=false;state.pausedRows=null;state.pausedEnd=null;$('pause').textContent='화면 일시정지';}else pauseView();$('scrub').value=1000;draw();};
 $('prev').onclick=()=>history(state.page-1);$('next').onclick=()=>history(state.page+1);
-$('scrub').oninput=()=>{if(state.mode==='live'&&!state.paused){state.paused=true;state.pausedRows=state.live.slice();$('pause').textContent='실시간 재개';}draw();};$('window').onchange=draw;$('reload').onclick=()=>sessions().catch(e=>$('error').textContent=e.message);
+$('scrub').oninput=()=>{clearSelection();if(state.mode==='live')pauseView();draw();};$('window').onchange=()=>{clearSelection();draw();};$('reload').onclick=()=>sessions().catch(e=>$('error').textContent=e.message);
 $('export').onclick=()=>{
+  if(state.mode==='history'){const a=document.createElement('a');a.href=`${api}/export?session_id=${state.session}`;a.click();$('notice').textContent='선택 세션 전체 CSV를 내려받습니다. 현재 페이지 밖의 표본도 포함됩니다.';return;}
   const rows=state.mode==='live'?(state.pausedRows||state.live).filter(r=>r.id):state.history;
   const keys=state.channels.map(c=>c.key);
   const statusKeys=batteryPage?['bms_online','bms_fault','bms_state','bms_age_ms','bms_charge_mos_on','bms_discharge_mos_on','bms_alarm_hex',...Array.from({length:48},(_,i)=>`cell_${i+1}_v`)]:rpmStatusKeys;

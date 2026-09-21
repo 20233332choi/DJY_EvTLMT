@@ -59,3 +59,14 @@ STM·ESP 펌웨어의 C/C++ 소스는 차량용이므로 유지합니다.
 - [아이폰 GPS](docs/IPHONE_BACKGROUND_GPS_20260920.md)
 - [STM·ESP 통합 안내](firmware/tv_stm_esp/README.md)
 - [배선도](docs/TORQUEVECTORING_PINMAP.svg)
+
+## 고속 텔레메트리와 그래프 값 선택
+
+- 실제 후방 STM → ESP는 238바이트 CRC16 바이너리, 460800 baud, 최대 100 Hz입니다. BMS CAN 전압·전류 요청은 10 ms이며 실제 응답 간격을 별도로 기록합니다.
+- ESP는 수신 이벤트를 FIFO에 담아 최대 64개/64 KiB씩 전달합니다. 서버는 표본별 취득 시각을 보존하고 한 묶음을 한 트랜잭션으로 기록합니다.
+- 피트 13개 / BMS 11개 그래프는 클릭한 표본의 값만 고정하며 계속 갱신됩니다. 별도 일시정지 버튼으로 화면을 정지할 수 있습니다.
+- 과거 세션 CSV는 전체 표본을 내려받습니다. `/records`의 원본 JSONL은 로컬 피트 PC에서 이용할 수 있습니다. 기존 인터넷 기록 조작·지도·휴대폰 GPS 기능은 유지합니다.
+
+실차 후방 프로젝트는 [`firmware/stm32_rear_binary`](firmware/stm32_rear_binary/README.md)입니다. 별도로 제공된 `stm_back.zip`을 반입한 뒤 송신 변경을 적용했으며, 과거 `firmware/tv_stm_esp/stm_back`은 그대로 보관합니다. 빌드는 `./scripts/build_stm32_rear_uart.ps1 -BinaryRear`로 선택합니다. **새 ESP 기본 바이너리 모드는 이 후방 펌웨어와 함께 적용해야 합니다.**
+
+버퍼 한계와 적용 순서는 [고속 수집 안내](docs/HIGH_RATE_TELEMETRY_KO.md), 패킷 정의는 [바이너리 UART](docs/BINARY_UART_KO.md), 검증 결과는 [PR 검증 기록](docs/PR_VALIDATION_20260921.md)을 참고하세요. 실측 피드백에 의한 10 kW 초과 차단은 이번 변경에 포함되지 않습니다.

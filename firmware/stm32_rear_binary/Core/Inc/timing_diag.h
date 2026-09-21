@@ -9,5 +9,5 @@ void Timing_RpmEdge(unsigned side,uint32_t captured_us,bool valid_period);
 void Timing_ControlBegin(uint32_t now);
 void Timing_ControlEnd(uint32_t started);
 void Timing_Publish(void);
-int Timing_FormatRelay(char *destination,size_t capacity);
+bool Timing_ReadRelay(uint32_t fields[19]);
 #endif

@@ -68,6 +68,9 @@ def project(packet):
     for key in INPUTS:
         value = source.get(key)
         valid = bool(packet.get('bms_online')) and finite(value)
+        timing = packet.get('bms_power_timing')
+        if key.startswith('battery_') and isinstance(timing, list):
+            valid = valid and len(timing) == 8 and finite(timing[4]) and 0 <= timing[4] < 2000
         if key in ('battery_pack_voltage_v', 'bms_max_cell_voltage_v', 'bms_min_cell_voltage_v'):
             valid = valid and value > 0
         if key == 'battery_soc_pct':
