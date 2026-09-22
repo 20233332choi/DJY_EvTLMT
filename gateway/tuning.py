@@ -30,7 +30,13 @@ CHANNELS = (
     ("pid_kp", "PID Kp · 보드 보고값", "", "settings", ("pid_online",)),
     ("pid_ki", "PID Ki · 보드 보고값", "", "settings", ("pid_online",)),
     ("pid_kd", "PID Kd · 보드 보고값", "", "settings", ("pid_online",)),
+    ("battery_pack_voltage_v", "배터리 팩 전압", "V", "battery_voltage", ("bms_online",)),
+    ("battery_current_a", "배터리 전류 · 방전 음수", "A", "battery_current", ("bms_online",)),
+    ("battery_power_kw", "배터리 실측 전력 · 방전 음수", "kW", "battery_power", ("bms_online",)),
+    ("lateral_accel_m_s2", "횡가속도", "m/s²", "acceleration", ("imu_online", "imu_ok")),
+    ("longitudinal_accel_m_s2", "종가속도", "m/s²", "acceleration", ("imu_online", "imu_ok")),
 )
+
 
 # Only these real packet inputs may refresh a plotted measurement. Other
 # members of the same sensor group must not turn a default zero into a sample.
@@ -52,17 +58,29 @@ INPUTS = {
     'traction_scale': ('traction_scale',),
     'tv_active': ('tv_active',), 'ed_active': ('ed_active',),
     'pid_kp': ('pid_kp',), 'pid_ki': ('pid_ki',), 'pid_kd': ('pid_kd',),
+    'battery_pack_voltage_v': ('battery_pack_voltage_v', 'pack_voltage_v'),
+    'battery_current_a': ('battery_current_a', 'pack_current_a'),
+    'battery_power_kw': ('battery_power_kw',),
+    'battery_soc_pct': ('battery_soc_pct', 'soc_pct', 'battery_pct', 'battery_soc'),
+    'bms_cell_delta_mv': ('bms_cell_delta_mv',),
+    'bms_temp_min_c': ('bms_temp_min_c',),
+    'bms_temp_max_c': ('bms_temp_max_c',),
+    'lateral_accel_m_s2': ('lateral_accel_m_s2', 'lat_accel'),
+    'longitudinal_accel_m_s2': ('longitudinal_accel_m_s2', 'lon_accel'),
 }
 
-def project(packet):
+def project(packet, channels=CHANNELS):
     values = {}
-    for key, _, _, _, flags in CHANNELS:
+    for key, _, _, _, flags in channels:
         value = packet.get('_tuning_values', packet).get(key)
         if key in ('tv_active', 'ed_active') and isinstance(value, bool):
             value = int(value)
         valid = (all(packet.get(flag) for flag in flags)
                  and not isinstance(value, bool) and isinstance(value, (int, float))
                  and math.isfinite(value))
+        if key.startswith('battery_') and isinstance(packet.get('bms_power_timing'), list):
+            timing = packet['bms_power_timing']
+            valid = valid and len(timing) == 8 and isinstance(timing[4], (int, float)) and 0 <= timing[4] < 2000
         if key.endswith('_target') and valid:
             valid = 0 <= value <= 65535
         if key in ('tv_active', 'ed_active', 'traction_scale') and valid:

@@ -57,7 +57,7 @@ with tempfile.TemporaryDirectory() as directory:
             page.wait_for_function("document.querySelector('#mode').textContent.includes('1페이지')")
             assert page.locator('#actual').inner_text() != '미수신'
             assert page.locator('#value-motor_left_voltage_v').inner_text().startswith('미수신')
-            assert page.locator('#plots canvas').count() == 9
+            assert page.locator('#plots canvas').count() == 13
             assert page.evaluate('getComputedStyle(document.body).backgroundColor') == 'rgb(0, 0, 0)'
             assert page.locator('#pid').inner_text() == '20.000 / 1.000 / 0.000'
             assert page.locator('#speed').inner_text() == '43.2'
@@ -85,7 +85,7 @@ with tempfile.TemporaryDirectory() as directory:
             assert '#00ffff' in stroke_colors()
             for checkbox in page.locator('#channels input').all():
                 checkbox.uncheck()
-            assert page.locator('#plots canvas').count() == 9
+            assert page.locator('#plots canvas').count() == 13
             assert set(stroke_colors()) <= {'#555555', '#ffffff'}
             for checkbox in page.locator('#channels input').all():
                 checkbox.check()
@@ -96,7 +96,8 @@ with tempfile.TemporaryDirectory() as directory:
             page.wait_for_function("document.querySelector('#mode').textContent.includes('1페이지')")
             page.locator('#window').select_option('all')
             page.locator('#canvas-yaw').hover()
-            assert '목표 yaw rate' in page.locator('#cursor').inner_text()
+            assert '선택 ' in page.locator('#cursorTime').inner_text()
+            assert 'rad/s' in page.locator('#plot-value-desired_yaw_rad_s').inner_text()
             with page.expect_download() as download:
                 page.locator('#export').click()
             assert download.value.suggested_filename.endswith('.csv')
@@ -143,7 +144,7 @@ with tempfile.TemporaryDirectory() as directory:
             assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             assert not errors, errors
             browser.close()
-        print(json.dumps({'browser':'Edge','errors':errors,'checks':['9 purpose panels','black background',f'{len(CHANNELS)} channels','PID and TV values','stale/missing PID and speed','reported RPM vs quality','explicit/missing target RPM','history RPM status','per-line visibility','hide all','history pages','missing voltage','cursor','CSV values and quality','record start/stop','pause keeps recording','mobile layout']}))
+        print(json.dumps({'browser':'Edge','errors':errors,'checks':['13 purpose panels','black background',f'{len(CHANNELS)} channels','PID and TV values','stale/missing PID and speed','reported RPM vs quality','explicit/missing target RPM','history RPM status','per-line visibility','hide all','history pages','missing voltage','cursor','CSV values and quality','record start/stop','pause keeps recording','mobile layout']}))
     finally:
         server.shutdown()
         server.server_close()

@@ -12,10 +12,13 @@
 #include "config.h"
 #include "djy_can_protocol.h"
 #include "djy_uart_protocol.h"
+#include "djy_telemetry_protocol.h"
 #include "letsencrypt_gen_y.h"
 #include "rear_uart_line.h"
 #include "rear_timing.h"
 #include "telemetry_queue.h"
+#include "telemetry_columns.h"
+#include "usb_telemetry.h"
 #if EV_RELAY_FAST_RSA_TLS
 #include "ngrok_tls_client.h"
 #endif
@@ -25,6 +28,11 @@
 
 #ifndef EV_REAR_UART_MODE
 #define EV_REAR_UART_MODE 0
+#endif
+
+// Default matches workspace stm_back. Set 0 only for the archived ASCII firmware.
+#ifndef EV_REAR_UART_BINARY
+#define EV_REAR_UART_BINARY 1
 #endif
 
 #ifndef EV_REAR_UART_RX_GPIO
@@ -156,6 +164,10 @@ struct VehicleState {
     uint32_t pidMs = 0;
     bool edActive = false;
     uint32_t rearUartRx = 0, rearUartErrors = 0, rearUartBytes = 0;
+    bool rearBinarySeen = false;
+    uint32_t rearSampleSequence = 0, rearTxSkipped = 0, rearMissingSamples = 0;
+    uint32_t rearDuplicateSamples = 0, rearClockResets = 0;
+    uint64_t rearSnapshotUs = 0;
     uint32_t rearRxHigh = 0, rearRxLow = 0;
     bool rpmLeftValid = false, rpmRightValid = false;
     uint32_t rearCommandRx = 0, rearCommandErrors = 0, rearExtendedMs = 0, tqvInternalMs = 0;
@@ -175,10 +187,18 @@ struct BmsState {
     float cells[48] = {};
     bool cellSeen[48] = {};
     uint32_t lastRxMs = 0;
+    bool powerSeen = false, powerRequested = false;
+    uint32_t powerLastRxMs = 0, powerRxCount = 0;
+    uint32_t powerRxIntervalMs = 0, powerMaxRxIntervalMs = 0;
+    uint32_t powerLastRequestMs = 0, powerRequestCount = 0;
+    uint32_t powerMaxRequestIntervalMs = 0, powerTxErrors = 0;
 } bms;
 
-uint8_t bmsRequestId = 0x90;
-uint32_t bmsNextRequestMs = 0;
+// Voltage/current have their own 10 ms schedule. The remaining eight IDs
+// rotate every 100 ms (800 ms per ID), initially offset from power polling.
+uint8_t bmsRequestId = 0x91;
+uint32_t bmsNextRequestMs = 5;
+uint32_t bmsNextPowerRequestMs = 0;
 
 DjyUartLiveTv liveCommand = {};
 bool liveCommandSeen = false;
@@ -196,13 +216,18 @@ bool jsonStringEquals(const String& input, const char* key, const char* expected
     return end >= start && input.substring(start, end) == expected;
 }
 
+constexpr uint32_t kUsbBaud = 3000000u;
+UsbTelemetry usbTelemetry;
+char relayColumns[3072] = {};
+char relayStreamId[17] = {};
+
 #if EV_RELAY_ENABLED
 portMUX_TYPE relayMux = portMUX_INITIALIZER_UNLOCKED;
-TelemetryQueue<kTelemetryJsonSize, 16> relaySamples;
-char relayStreamId[17] = {};
-constexpr size_t kRelayBatchSize = 4 * kTelemetryJsonSize + 512;
-// Task-owned static buffer avoids a 17 KB stack allocation.
-char relayBatch[kRelayBatchSize] = {};
+// Variable-length rows share 96 KiB instead of reserving 4 KiB per sample.
+TelemetryQueue<1536, 256, 96 * 1024> relaySamples;
+constexpr size_t kRelayBatchSize = 64 * 1024;
+// Only the header is copied; HTTPClient streams frozen FIFO rows directly.
+char relayPrefix[4096] = {};
 char relayCommand[512] = {};
 bool relayCommandPending = false;
 uint32_t relayTxCount = 0;
@@ -214,11 +239,36 @@ int relayDnsStatus = 0;
 int relayTcp443Status = 0;
 int relayTlsError = 0;
 
-void stageRelayTelemetry(const char* json) {
-    portENTER_CRITICAL(&relayMux);
-    relaySamples.push(state.sequence, json);
-    portEXIT_CRITICAL(&relayMux);
-}
+class RelayBody : public Stream {
+public:
+    RelayBody(const char* prefix, size_t count, size_t arrayLength)
+        : prefix_(prefix), prefixLength_(strlen(prefix)), count_(count), arrayLength_(arrayLength) {}
+    int available() override { return static_cast<int>(prefixLength_ + arrayLength_ + 1 - position_); }
+    size_t readBytes(char* output, size_t length) override {
+        size_t used = 0;
+        while (used < length && available()) {
+            size_t copied = 0;
+            if (position_ < prefixLength_) {
+                copied = prefixLength_ - position_;
+                if (copied > length - used) copied = length - used;
+                memcpy(output + used, prefix_ + position_, copied);
+            } else if (position_ < prefixLength_ + arrayLength_) {
+                copied = relaySamples.readBatch(output + used, position_ - prefixLength_, length - used, count_);
+            } else {
+                output[used] = '}'; copied = 1;
+            }
+            if (!copied) break;
+            position_ += copied; used += copied;
+        }
+        return used;
+    }
+    int read() override { char value; return readBytes(&value, 1) ? static_cast<uint8_t>(value) : -1; }
+    int peek() override { const size_t saved = position_; const int value = read(); position_ = saved; return value; }
+    size_t write(uint8_t) override { return 0; }
+private:
+    const char* prefix_;
+    size_t prefixLength_, count_, arrayLength_, position_ = 0;
+};
 
 void stageRelayCommand(const String& response) {
 #if EV_RELAY_ACCEPT_COMMANDS
@@ -267,8 +317,6 @@ void relayTask(void*) {
         relayAuthority = relayAuthority.substring(0, portMarker);
     }
 
-    snprintf(relayStreamId, sizeof(relayStreamId), "%08lx%08lx",
-             static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
     uint32_t retryMs = 1000;
     bool networkPathChecked = false;
     bool networkTimeRequested = false;
@@ -334,9 +382,6 @@ void relayTask(void*) {
             const int dnsOk = WiFi.hostByName(relayAuthority.c_str(), relayAddress) == 1 ? 1 : -1;
             int tcpOk = 0;
             if (dnsOk == 1) {
-                Serial.printf("# Relay resolved=%s epoch=%ld free_heap=%u\n",
-                              relayAddress.toString().c_str(), static_cast<long>(time(nullptr)),
-                              static_cast<unsigned>(ESP.getFreeHeap()));
                 WiFiClient tcpProbe;
                 tcpOk = tcpProbe.connect(relayAddress, relayPort, 5000) == 1 ? 1 : -1;
                 tcpProbe.stop();
@@ -351,18 +396,23 @@ void relayTask(void*) {
         uint32_t lastSequence = 0;
         uint32_t droppedSamples = 0;
         size_t queuedSamples = 0;
+        size_t arrayLength = 0;
+        const uint32_t exchangeStart = millis();
         portENTER_CRITICAL(&relayMux);
         droppedSamples = relaySamples.dropped();
-        const int prefix = snprintf(relayBatch, sizeof(relayBatch),
-            "{\"stream_id\":\"%s\",\"sent_ms\":%lu,\"dropped_samples\":%lu,\"samples\":",
-            relayStreamId, static_cast<unsigned long>(millis()), static_cast<unsigned long>(droppedSamples));
-        queuedSamples = relaySamples.batch(relayBatch + prefix, sizeof(relayBatch) - prefix - 1, 4, lastSequence);
+        const int prefix = snprintf(relayPrefix, sizeof(relayPrefix),
+            "{\"stream_id\":\"%s\",\"sent_ms\":%lu,\"dropped_samples\":%lu,"
+            "\"queue_samples\":%u,\"queue_bytes\":%u,\"columns\":%s,\"samples\":",
+            relayStreamId, static_cast<unsigned long>(exchangeStart), static_cast<unsigned long>(droppedSamples),
+            static_cast<unsigned>(relaySamples.count()), static_cast<unsigned>(relaySamples.bytes()),
+            relayColumns[0] ? relayColumns : "[]");
+        queuedSamples = relaySamples.batchInfo(kRelayBatchSize - static_cast<size_t>(prefix) - 1, 64, lastSequence, arrayLength);
         portEXIT_CRITICAL(&relayMux);
         if (queuedSamples == 0) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        strlcat(relayBatch, "}", sizeof(relayBatch));
+        RelayBody body(relayPrefix, queuedSamples, arrayLength);
 
         bool success = false;
         if (http.begin(*relayClient, relayUrl)) {
@@ -370,7 +420,7 @@ void relayTask(void*) {
             http.addHeader("Authorization", String("Bearer ") + relayToken);
             http.addHeader("X-Vehicle-ID", EV_VEHICLE_ID);
             http.addHeader("ngrok-skip-browser-warning", "1");
-            const int status = http.POST(reinterpret_cast<uint8_t*>(relayBatch), strlen(relayBatch));
+            const int status = http.sendRequest("POST", &body, static_cast<size_t>(body.available()));
             char tlsErrorText[96] = {};
             const int tlsError = relayUsesTls && status < 0
                                      ? secureClient.lastError(tlsErrorText, sizeof(tlsErrorText))
@@ -409,12 +459,37 @@ void relayTask(void*) {
             vTaskDelay(pdMS_TO_TICKS(retryMs));
             retryMs = min<uint32_t>(retryMs * 2u, 5000u);
         } else {
-            // Bound request rate; keep-alive saves TLS work, not HTTP quota.
-            vTaskDelay(pdMS_TO_TICKS(250));
+            // At most 5 exchanges/s; HTTP time is part of the 200 ms period.
+            const uint32_t elapsed = millis() - exchangeStart;
+            if (elapsed < 200u) vTaskDelay(pdMS_TO_TICKS(200u - elapsed));
         }
     }
 }
 #endif
+
+void stageTelemetry(const char* json) {
+    static char columns[sizeof(relayColumns)], row[1536];
+    const bool valid = telemetryColumns(json, columns, sizeof(columns), row, sizeof(row));
+#if EV_RELAY_ENABLED
+    portENTER_CRITICAL(&relayMux);
+#endif
+    if (!valid || (relayColumns[0] && strcmp(relayColumns, columns))) {
+        usbTelemetry.reject();
+#if EV_RELAY_ENABLED
+        relaySamples.reject();
+#endif
+    }
+    else {
+        if (!relayColumns[0]) memcpy(relayColumns, columns, strlen(columns) + 1);
+        usbTelemetry.push(state.sequence, row);
+#if EV_RELAY_ENABLED
+        relaySamples.push(state.sequence, row);
+#endif
+    }
+#if EV_RELAY_ENABLED
+    portEXIT_CRITICAL(&relayMux);
+#endif
+}
 
 void setStatusLed(uint8_t red, uint8_t green, uint8_t blue) {
 #if EV_STATUS_LED_ENABLED
@@ -439,15 +514,6 @@ void runStatusLedSelfTest() {
 }
 
 void maintainWifi() {
-    static uint32_t lastReport = 0;
-    const uint32_t reportNow = millis();
-    if (reportNow - lastReport >= 2000u) {
-        lastReport = reportNow;
-        Serial.printf("# WiFi status=%d ip=%s rssi=%ld reconnects=%lu\n",
-                      static_cast<int>(WiFi.status()), WiFi.localIP().toString().c_str(),
-                      WiFi.status() == WL_CONNECTED ? static_cast<long>(WiFi.RSSI()) : -127L,
-                      static_cast<unsigned long>(wifiReconnectAttempts));
-    }
     if (WiFi.status() == WL_CONNECTED) return;
     const uint32_t now = millis();
     if (now - wifiLastReconnectMs < 15000u) return;
@@ -565,6 +631,19 @@ uint32_t bmsU32(const uint8_t* data, uint8_t offset) {
            (static_cast<uint32_t>(data[offset + 2]) << 8) | data[offset + 3];
 }
 
+#if EV_BMS_CAN_ENABLED
+bool sendBmsCanRequest(uint8_t id) {
+    twai_message_t request = {};
+    request.identifier = 0x18000000u | (static_cast<uint32_t>(id) << 16) | 0x0140u;
+    request.extd = 1;
+    request.data_length_code = 8;
+    return twai_transmit(&request, 0) == ESP_OK;
+}
+#endif
+
+bool rearSamplePending = false, bmsSamplePending = false;
+void publishTelemetry();
+
 void receiveBmsCan() {
 #if EV_BMS_CAN_ENABLED
     twai_message_t frame = {};
@@ -576,9 +655,21 @@ void receiveBmsCan() {
         const uint8_t* d = frame.data;
         bms.lastRxMs = millis();
         if (id == 0x90) {
+            // These are ESP dequeue times, not BMS ADC acquisition timestamps.
+            if (bms.powerSeen) {
+                bms.powerRxIntervalMs = bms.lastRxMs - bms.powerLastRxMs;
+                if (bms.powerRxIntervalMs > bms.powerMaxRxIntervalMs)
+                    bms.powerMaxRxIntervalMs = bms.powerRxIntervalMs;
+            }
+            bms.powerSeen = true;
+            bms.powerLastRxMs = bms.lastRxMs;
+            ++bms.powerRxCount;
             bms.voltage = bmsU16(d, 0) / 10.0f;
             bms.current = (static_cast<int32_t>(bmsU16(d, 4)) - 30000) / 10.0f;
             bms.soc = bmsU16(d, 6) / 10.0f;
+            // Preserve each voltage/current response, even between Rear frames.
+            bmsSamplePending = true;
+            publishTelemetry();
         } else if (id == 0x91) {
             bms.maxCell = bmsU16(d, 0) / 1000.0f; bms.maxCellNumber = d[2];
             bms.minCell = bmsU16(d, 3) / 1000.0f; bms.minCellNumber = d[5];
@@ -608,13 +699,25 @@ void receiveBmsCan() {
         }
     }
     const uint32_t now = millis();
+    if (bmsCanReady && static_cast<int32_t>(now - bmsNextPowerRequestMs) >= 0) {
+        if (sendBmsCanRequest(0x90)) {
+            if (bms.powerRequested) {
+                const uint32_t interval = now - bms.powerLastRequestMs;
+                if (interval > bms.powerMaxRequestIntervalMs)
+                    bms.powerMaxRequestIntervalMs = interval;
+            }
+            bms.powerRequested = true;
+            bms.powerLastRequestMs = now;
+            ++bms.powerRequestCount; // Accepted by TWAI, not a confirmed BMS reply.
+        } else {
+            ++bms.powerTxErrors;
+        }
+        // No burst of catch-up requests after a delayed loop or a full TX queue.
+        bmsNextPowerRequestMs = now + 10u;
+    }
     if (bmsCanReady && static_cast<int32_t>(now - bmsNextRequestMs) >= 0) {
-        twai_message_t request = {};
-        request.identifier = 0x18000000u | (static_cast<uint32_t>(bmsRequestId) << 16) | 0x0140u;
-        request.extd = 1;
-        request.data_length_code = 8;
-        if (twai_transmit(&request, 0) == ESP_OK) {
-            bmsRequestId = bmsRequestId == 0x98 ? 0x90 : static_cast<uint8_t>(bmsRequestId + 1u);
+        if (sendBmsCanRequest(bmsRequestId)) {
+            bmsRequestId = bmsRequestId == 0x98 ? 0x91 : static_cast<uint8_t>(bmsRequestId + 1u);
             bmsNextRequestMs = now + 100u;
         } else {
             bmsNextRequestMs = now + 20u;
@@ -666,6 +769,78 @@ void receiveCan() {
             state.configSequence = frame.data[5]; state.configAck = true;
         }
     }
+}
+
+bool parseRearTelemetry(const uint8_t* data, size_t size) {
+    DjyTelemetry p;
+    if (!djy_telemetry_unpack(&p, data, size)) return false;
+    if (state.rearBinarySeen) {
+        if (p.sequence == state.rearSampleSequence && p.snapshot_us == state.rearSnapshotUs) {
+            ++state.rearDuplicateSamples;
+            return false; // Do not refresh data freshness for replayed samples.
+        }
+        if (p.snapshot_us < state.rearSnapshotUs) {
+            ++state.rearClockResets;
+        } else {
+            const uint32_t advance = p.sequence - state.rearSampleSequence;
+            if (advance > 0u && advance <= 0x7fffffffu)
+                state.rearMissingSamples += advance - 1u;
+        }
+    }
+    const uint32_t now = millis();
+    state.rearBinarySeen = true;
+    state.rearSampleSequence = p.sequence;
+    state.rearSnapshotUs = p.snapshot_us;
+    state.rearTxSkipped = p.tx_skipped;
+    state.captureLeft = p.capture_left; state.captureRight = p.capture_right;
+    state.glitchLeft = p.glitch_left; state.glitchRight = p.glitch_right;
+    // Preserve the existing telemetry noise check without uint32 wrap.
+    state.rpmLeft = uint64_t(p.glitch_left) > uint64_t(p.capture_left) + 100u ? 0u : p.rpm_left;
+    state.rpmRight = uint64_t(p.glitch_right) > uint64_t(p.capture_right) + 100u ? 0u : p.rpm_right;
+    state.rpmLeftValid = (p.flags & DJY_TM_RPM_LEFT_VALID) != 0u;
+    state.rpmRightValid = (p.flags & DJY_TM_RPM_RIGHT_VALID) != 0u;
+    state.tpsRaw = p.tps_raw; state.tpsReportedPct = p.tps_pct;
+    state.sasRaw = p.sas_raw; state.sasCenterRaw = p.sas_center;
+    state.sasValid = (p.flags & DJY_TM_SAS_VALID) != 0u;
+    state.steeringRad = p.steer_milli / 1000.0f;
+    state.imuValid = (p.flags & DJY_TM_IMU_VALID) != 0u;
+    state.yawRateRadS = p.yaw_milli / 1000.0f;
+    state.lateralAccelMS2 = p.lat_milli / 1000.0f;
+    state.longitudinalAccelMS2 = state.imuRawAx = p.ax_milli / 1000.0f;
+    state.imuRawAy = p.ay_milli / 1000.0f; state.imuRawAz = p.az_milli / 1000.0f;
+    state.vehicleSpeedMS = p.speed_milli / 1000.0f;
+    state.desiredYawRadS = p.desired_yaw_milli / 1000.0f;
+    state.yawErrorRadS = p.yaw_error_milli / 1000.0f;
+    state.deltaPowerKw = p.delta_power_milli / 1000.0f;
+    state.powerLeftKw = p.power_left_milli / 1000.0f;
+    state.powerRightKw = p.power_right_milli / 1000.0f;
+    state.tractionScale = p.traction_milli / 1000.0f;
+    state.pidKp = p.kp_milli / 1000.0f;
+    state.pidKi = p.ki_milli / 1000.0f; state.pidKd = p.kd_milli / 1000.0f;
+    state.tvRequested = p.requested; state.tvLimit = p.limit; state.tvApplied = p.applied;
+    state.configSequence = p.command_sequence;
+    state.configAck = liveCommandSeen && state.configSequence == liveCommand.sequence;
+    const bool controlFresh = (p.flags & DJY_TM_CONTROL_FRESH) != 0u;
+    state.driverMs = controlFresh ? now : 0u;
+    state.edActive = (p.flags & DJY_TM_ED_ACTIVE) != 0u;
+    state.rearFlags = 0u;
+    if (controlFresh) state.rearFlags |= DJY_REAR_STATUS_CONTROL_FRESH;
+    if (p.flags & DJY_TM_TV_ACTIVE) state.rearFlags |= DJY_REAR_STATUS_TV_ACTIVE;
+    if (state.edActive) state.rearFlags |= DJY_REAR_STATUS_ED_ACTIVE;
+    if (p.fault) state.rearFlags |= DJY_REAR_STATUS_FAULT;
+    state.fault = p.fault; state.dacLeft = p.dac_left; state.dacRight = p.dac_right;
+    state.rearCommandRx = p.command_rx; state.rearCommandErrors = p.command_errors;
+    state.stmCanRx = p.can_rx; state.stmCanErrors = p.can_errors; state.stmCanStatus = p.can_status;
+    state.stmImuDiag0 = p.imu_gyro_ok; state.stmImuDiag1 = p.imu_pkt_bad;
+    state.stmImuDiag2 = p.imu_resync; state.stmImuDiag3 = p.imu_dma_restart;
+    state.timing.valid = p.timing_valid != 0u;
+    for (unsigned i = 0; i < DJY_TELEMETRY_TIMING_WORDS; ++i)
+        state.timing.fields[i] = i == 11u ? int64_t(djy_tm_signed(p.timing[i])) : int64_t(p.timing[i]);
+    state.tpsMs = state.sasMs = state.rearMs = now;
+    state.pidMs = state.rearExtendedMs = state.tqvInternalMs = now;
+    ++state.rearSequence;
+    ++state.rearUartRx;
+    return true;
 }
 
 bool parseRearUartLine(const char* line) {
@@ -882,10 +1057,31 @@ bool parseRearUartLine(const char* line) {
     return true;
 }
 
-bool rearSamplePending = false;
-void publishTelemetry();
-
 void receiveRearUart() {
+#if EV_REAR_UART_BINARY
+    static DjyTelemetryRx receiver = {};
+    static uint32_t lastByteMs = 0;
+    if (receiver.used && millis() - lastByteMs > 50u) {
+        receiver.used = 0; // Discard incomplete frames after a prolonged gap.
+        ++state.rearUartErrors;
+    }
+    if (digitalRead(EV_REAR_UART_RX_GPIO) == HIGH) ++state.rearRxHigh;
+    else ++state.rearRxLow;
+    while (rearUart.available()) {
+        ++state.rearUartBytes;
+        lastByteMs = millis();
+        const uint32_t errorsBefore = receiver.errors;
+        const bool ready = djy_telemetry_push(&receiver, static_cast<uint8_t>(rearUart.read()));
+        state.rearUartErrors += receiver.errors - errorsBefore;
+        if (ready) {
+            if (!parseRearTelemetry(receiver.bytes, DJY_TELEMETRY_SIZE)) ++state.rearUartErrors;
+            else {
+                rearSamplePending = true;
+                publishTelemetry();
+            }
+        }
+    }
+#else
     static RearUartLine line;
     if (digitalRead(EV_REAR_UART_RX_GPIO) == HIGH) ++state.rearRxHigh;
     else ++state.rearRxLow;
@@ -903,6 +1099,7 @@ void receiveRearUart() {
             }
         }
     }
+#endif
 }
 
 void sendPitConfig(const String& input) {
@@ -981,9 +1178,29 @@ void receiveCommands() {
         while (commandUdp.available()) input += static_cast<char>(commandUdp.read());
         if (trustedPit) handleCommand(input);
     }
-    if (Serial.available()) {
-        String input = Serial.readStringUntil('\n');
-        handleCommand(input);
+    // Commands/recording ACKs may be split across UART reads. Never wait for LF.
+    static char usbInput[512];
+    static size_t usbLength = 0;
+    static bool usbOverflow = false;
+    for (unsigned n = 0; n < 512 && Serial.available(); ++n) {
+        const char value = static_cast<char>(Serial.read());
+        if (value == '\n') {
+            usbInput[usbLength] = '\0';
+            if (!usbOverflow) {
+                const String input(usbInput);
+                if (jsonStringEquals(input, "type", "usb_start")) usbTelemetry.start();
+                else if (jsonStringEquals(input, "type", "usb_ack") &&
+                         jsonStringEquals(input, "stream_id", relayStreamId)) {
+                    const int key = input.indexOf("\"ack_seq\"");
+                    const int colon = key >= 0 ? input.indexOf(':', key) : -1;
+                    if (colon >= 0) usbTelemetry.acknowledge(strtoul(input.c_str() + colon + 1, nullptr, 10));
+                } else handleCommand(input);
+            }
+            usbLength = 0; usbOverflow = false;
+        } else if (value != '\r') {
+            if (usbLength + 1 < sizeof(usbInput)) usbInput[usbLength++] = value;
+            else usbOverflow = true;
+        }
     }
 #if EV_RELAY_ENABLED && EV_RELAY_ACCEPT_COMMANDS
     char pending[sizeof(relayCommand)] = {};
@@ -1002,9 +1219,11 @@ void receiveCommands() {
 void publishTelemetry() {
     static uint32_t previous = 0;
     // Every Rear record is published immediately. With no Rear input, retain
-    // a 1 Hz heartbeat/BMS update; never poll-and-overwrite multiple records.
-    if (!rearSamplePending && millis() - previous < (EV_REAR_UART_MODE ? 1000u : 200u)) return;
+    // a 1 Hz heartbeat; Rear frames and BMS power replies each keep every event.
+    if (!rearSamplePending && !bmsSamplePending && millis() - previous < (EV_REAR_UART_MODE ? 1000u : 200u)) return;
+    const char* sampleKind = rearSamplePending ? "rear" : bmsSamplePending ? "bms" : "heartbeat";
     rearSamplePending = false;
+    bmsSamplePending = false;
     previous = millis();
     ++state.sequence;
     const bool driverFresh = state.driverMs != 0u && millis() - state.driverMs < 200u;
@@ -1073,8 +1292,20 @@ void publishTelemetry() {
     char json[kTelemetryJsonSize];
     char timingJson[256];
     if(!state.timing.json(timingJson,sizeof(timingJson)))return;
+    // Compact metadata: version, seq, clock hi/lo (us), STM skips, RX gaps,
+    // duplicate frames, observed clock regressions. Existing timestamp_ms
+    // remains the ESP clock required by the HTTPS batching contract.
+    char sampleJson[128] = "null";
+    if (state.rearBinarySeen) {
+        const int n = snprintf(sampleJson, sizeof(sampleJson), "[1,%lu,%lu,%lu,%lu,%lu,%lu,%lu]",
+            (unsigned long)state.rearSampleSequence,
+            (unsigned long)(state.rearSnapshotUs >> 32), (unsigned long)(uint32_t)state.rearSnapshotUs,
+            (unsigned long)state.rearTxSkipped, (unsigned long)state.rearMissingSamples,
+            (unsigned long)state.rearDuplicateSamples, (unsigned long)state.rearClockResets);
+        if (n < 0 || (size_t)n >= sizeof(sampleJson)) return;
+    }
     int jsonLength = snprintf(json, sizeof(json),
-        "{\"board_timing\":%s,\"seq\":%lu,\"timestamp_ms\":%lu,\"rpm_left\":%u,\"rpm_right\":%u,"
+        "{\"stream_id\":\"%s\",\"vehicle_id\":\"%s\",\"rear_sample\":%s,\"board_timing\":%s,\"seq\":%lu,\"timestamp_ms\":%lu,\"rpm_left\":%u,\"rpm_right\":%u,"
         "\"rpm_left_reported\":%u,\"rpm_right_reported\":%u,\"rpm_left_reported_online\":%s,\"rpm_right_reported_online\":%s,"
         "\"rpm_left_quality\":\"%s\",\"rpm_right_quality\":\"%s\","
         "\"cap_left\":%lu,\"cap_right\":%lu,\"rpm_glitch_left\":%lu,\"rpm_glitch_right\":%lu,"
@@ -1100,7 +1331,7 @@ void publishTelemetry() {
         "\"internet_relay_tx\":%lu,\"internet_relay_errors\":%lu,\"internet_relay_commands\":%lu,"
         "\"internet_relay_last_http_status\":%d,\"internet_relay_dns_ok\":%d,"
         "\"internet_relay_tcp443_ok\":%d,\"internet_relay_tls_error\":%d}",
-        timingJson,static_cast<unsigned long>(state.sequence), static_cast<unsigned long>(millis()),
+        relayStreamId,EV_VEHICLE_ID,sampleJson,timingJson,static_cast<unsigned long>(state.sequence), static_cast<unsigned long>(millis()),
         state.rpmLeft, state.rpmRight,
         state.rpmLeft, state.rpmRight, rearFresh ? "true" : "false", rearFresh ? "true" : "false",
         rpmLeftQuality, rpmRightQuality,
@@ -1165,7 +1396,8 @@ void publishTelemetry() {
         "\"bms_temp_max_c\":%.1f,\"bms_temp_min_c\":%.1f,\"bms_cycle_count\":%u,"
         "\"bms_charge_mos_on\":%s,\"bms_discharge_mos_on\":%s,\"bms_charger_present\":%s,"
         "\"bms_load_present\":%s,\"bms_balancing\":%s,\"bms_alarm_hex\":\"%s\","
-        "\"bms_alarm_summary\":\"%s\",\"bms_cell_voltages_v\":%s}",
+        "\"bms_alarm_summary\":\"%s\",\"bms_cell_voltages_v\":%s,"
+        "\"bms_power_timing\":[1,%lu,%lu,%lu,%lld,%lu,%lu,%lu],\"sample_kind\":\"%s\"}",
         bmsOnline ? "true" : "false", bmsOnline && !bmsFault ? "true" : "false",
         bmsFault ? "true" : "false", bmsState,
         bmsOnline ? static_cast<unsigned long>(millis() - bms.lastRxMs) : 0ul,
@@ -1175,7 +1407,12 @@ void publishTelemetry() {
         bms.maxTemp, bms.minTemp, bms.cycleCount,
         bms.chargeMos ? "true" : "false", bms.dischargeMos ? "true" : "false",
         bms.charger ? "true" : "false", bms.load ? "true" : "false",
-        bms.balancing ? "true" : "false", alarmHex, bmsFault ? "ALARM" : "NONE", cellsJson);
+        bms.balancing ? "true" : "false", alarmHex, bmsFault ? "ALARM" : "NONE", cellsJson,
+        static_cast<unsigned long>(bms.powerRequestCount), static_cast<unsigned long>(bms.powerTxErrors),
+        static_cast<unsigned long>(bms.powerRxCount),
+        bms.powerSeen ? static_cast<long long>(static_cast<uint32_t>(millis() - bms.powerLastRxMs)) : -1LL,
+        static_cast<unsigned long>(bms.powerRxIntervalMs), static_cast<unsigned long>(bms.powerMaxRxIntervalMs),
+        static_cast<unsigned long>(bms.powerMaxRequestIntervalMs), sampleKind);
     if (bmsJsonLength < 0 || static_cast<size_t>(bmsJsonLength) >= sizeof(json) - static_cast<size_t>(jsonLength) + 1u) return;
     jsonLength += bmsJsonLength - 1;  // BMS fields replace the original closing brace.
 
@@ -1197,15 +1434,7 @@ void publishTelemetry() {
             }
         }
     }
-#if EV_RELAY_ENABLED
-    stageRelayTelemetry(json);
-#endif
-    // Queue USB debug at 1 Hz; never block UART reception for a 3 KB JSON.
-    static uint32_t lastUsbMs = 0;
-    if (millis() - lastUsbMs >= 1000u && Serial.availableForWrite() >= jsonLength + 2) {
-        Serial.println(json);
-        lastUsbMs = millis();
-    }
+    stageTelemetry(json);
     state.configAck = false;
 }
 
@@ -1213,18 +1442,22 @@ void publishTelemetry() {
 
 void setup() {
     Serial.setTxBufferSize(4096);
-    Serial.begin(115200);
+    Serial.begin(kUsbBaud);
+    snprintf(relayStreamId, sizeof(relayStreamId), "%08lx%08lx",
+             static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
     Serial.setTimeout(10);
     Serial.println("# DJY ESP gateway boot");
     runStatusLedSelfTest();
     pinMode(EV_PIT_ENABLE_GPIO, INPUT_PULLUP);
 
     if (EV_REAR_UART_MODE) {
-        rearUart.setRxBufferSize(1024); // One extended line exceeds the default 256 bytes.
-        rearUart.begin(115200, SERIAL_8N1, EV_REAR_UART_RX_GPIO, EV_REAR_UART_TX_GPIO);
+        const uint32_t rearBaud = EV_REAR_UART_BINARY ? DJY_TELEMETRY_BAUD : 115200u;
+        rearUart.setRxBufferSize(2048); // Holds eight complete 238-byte binary frames.
+        rearUart.begin(rearBaud, SERIAL_8N1, EV_REAR_UART_RX_GPIO, EV_REAR_UART_TX_GPIO);
         rearUartReady = static_cast<bool>(rearUart);
-        Serial.printf("# Rear UART ready=%u RX GPIO%d TX GPIO%d, 115200 8N1, receive_only=%u\n",
-                      rearUartReady, EV_REAR_UART_RX_GPIO, EV_REAR_UART_TX_GPIO, EV_RECEIVE_ONLY);
+        Serial.printf("# Rear UART ready=%u RX GPIO%d TX GPIO%d, %lu 8N1, %s, receive_only=%u\n",
+                      rearUartReady, EV_REAR_UART_RX_GPIO, EV_REAR_UART_TX_GPIO,
+                      (unsigned long)rearBaud, EV_REAR_UART_BINARY ? "binary" : "ASCII", EV_RECEIVE_ONLY);
 #if EV_BMS_CAN_ENABLED
         const twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(
             static_cast<gpio_num_t>(EV_BMS_CAN_TX_GPIO), static_cast<gpio_num_t>(EV_BMS_CAN_RX_GPIO), TWAI_MODE_NORMAL);
@@ -1270,5 +1503,7 @@ void loop() {
     maintainWifi();
     updateStatusLed();
     publishTelemetry();
+    for (unsigned i = 0; i < 4; ++i)
+        usbTelemetry.poll(Serial, millis(), relayColumns, relayStreamId, EV_VEHICLE_ID);
     delay(1);
 }

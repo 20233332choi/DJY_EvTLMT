@@ -40,6 +40,17 @@ class BatteryDashboardTests(unittest.TestCase):
             self.assertIsNone(with_power({'battery_pack_voltage_v': 72,
                                          'battery_current_a': invalid})['battery_power_w'])
 
+    def test_wireless_power_age_cannot_be_refreshed_by_other_bms_frames(self):
+        packet = {'bms_online': True, 'battery_pack_voltage_v': 72,
+                  'battery_current_a': -100, 'battery_soc_pct': 80,
+                  'bms_temp_min_c': 24, 'bms_power_timing': [10, 1, 0, 1, 2000, 10, 10, 10]}
+        values = project(packet)
+        for key in ('battery_pack_voltage_v', 'battery_current_a', 'battery_power_w', 'battery_power_kw', 'battery_soc_pct'):
+            self.assertIsNone(values[key])
+        self.assertEqual(values['bms_temp_min_c'], 24)
+        packet['bms_power_timing'][4] = 10
+        self.assertEqual(project(packet)['battery_power_w'], -7200)
+
     def test_recording_retains_bms_and_commands_without_fake_motor_measurements(self):
         with tempfile.TemporaryDirectory() as folder:
             gateway = EVGateway('127.0.0.1', 0, '127.0.0.1', 19004, database_path=Path(folder)/'test.db')

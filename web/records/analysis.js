@@ -53,7 +53,7 @@ async function sessions(){state.sessions=(await api('/api/records/sessions')).se
 async function select(sid){
   state.controller?.abort();const controller=new AbortController(),generation=++state.generation;
   state.controller=controller;state.sid=sid;state.busy=true;state.rows=[];state.visible=[];state.index=0;state.through=0;state.page=0;state.pinned=false;mapInitial=false;
-  $('cancel').hidden=false;$('latest').disabled=true;$('download').hidden=true;$('title').textContent=`세션 #${sid} 불러오는 중`;
+  $('cancel').hidden=false;$('latest').disabled=true;$('download').hidden=true;$('downloadRaw').hidden=true;$('title').textContent=`세션 #${sid} 불러오는 중`;
   $('error').textContent='';renderSessions();renderPanels();schedule(true,true,true);
   let after=0;const rows=[];
   try{
@@ -68,6 +68,7 @@ async function select(sid){
     $('title').textContent=`#${sid} · ${state.session.label||'이름 없는 측정'}`;
     $('sessionInfo').textContent=`시작 ${stamp(state.session.started_at_utc)} · ${state.session.stopped_at_utc?'종료 '+stamp(state.session.stopped_at_utc):'기록 중 · 최신 저장분은 다시 읽기'} · ${rows.length.toLocaleString()}표본`;
     $('loadStatus').textContent=`전체 ${rows.length.toLocaleString()}개 로드 완료`;
+    $('downloadRaw').hidden=false;$('downloadRaw').href=`/api/recording/export?session_id=${sid}&through=${state.through}`;
     $('download').hidden=false;$('download').href=`/api/records/export.csv?session_id=${sid}&through=${state.through}`;
     state.index=Math.max(0,state.rows.findIndex(r=>finite(r.values.battery_power_w)));
     schedule(true,true,true);

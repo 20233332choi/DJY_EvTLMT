@@ -7,7 +7,7 @@ from host_compiler import compiler
 
 class FrontTimingTests(unittest.TestCase):
     def test_async_queue_full_wrap_and_buffer_lifetime(self):
-        front=Path.home()/'Documents/TV/stm_front/Core'
+        front=Path(__file__).resolve().parents[1]/'firmware/stm32_front_synced/Core'
         with tempfile.TemporaryDirectory() as tmp:
             folder=Path(tmp)
             for name in ('front_timing.c',):shutil.copyfile(front/'Src'/name,folder/name)

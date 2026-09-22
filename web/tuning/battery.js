@@ -22,20 +22,24 @@ window.batteryDashboard = {
       hasChange=hasChange||Boolean(valid);
     }
     $('changeContext').textContent=hasChange?'표시 구간 기준 · 포인터로 비교 시점 선택':'구간 내 유효값 대기';
+    const liveStatus=state.mode==='live';
+    if(liveStatus)status=state.currentStatus||{};
+    const statusValues=liveStatus?(state.current||{}):values;
+    $('bmsStateContext').textContent=liveStatus?'셀·MOS·알람: 현재 수신 상태':`셀·MOS·알람: 선택 시점 ${selected?time(selected.time_ms):'기록 없음'}`;
     $('bmsState').textContent=status.bms_online?(status.bms_state||'수신 중'):'BMS 미수신';
     $('bmsState').classList.toggle('alarm',status.bms_fault===true);
     $('mos').textContent=`충전 ${on(status.bms_charge_mos_on)} / 방전 ${on(status.bms_discharge_mos_on)}`;
     $('load').textContent=`충전기 ${on(status.bms_charger_present)} / 부하 ${on(status.bms_load_present)}`;
-    $('temps').textContent=`${unit(values.bms_temp_min_c,'°C')} / ${unit(values.bms_temp_max_c,'°C')}`;
+    $('temps').textContent=`${unit(statusValues.bms_temp_min_c,'°C')} / ${unit(statusValues.bms_temp_max_c,'°C')}`;
     $('extra').textContent=`${on(status.bms_balancing)} / ${unit(status.bms_remaining_capacity_ah,'Ah',2)}`;
     $('cycles').textContent=format(status.bms_cycle_count,0);
     $('alarm').textContent=status.bms_online?(status.bms_fault===true?`경고 · ${status.bms_alarm_summary||status.bms_alarm_hex||'BMS 알람'}`:status.bms_fault===false?'보고된 알람 없음':'알람 상태 미수신'):'미수신';
     $('alarm').classList.toggle('alarm',status.bms_fault===true);
-    $('bmsAge').textContent=finite(status.bms_age_ms)?`최근 BMS 프레임 ${format(status.bms_age_ms,0)} ms 전 · 전압/전류 개별 시각은 미제공`:'CAN 수신 대기';
+    $('bmsAge').textContent=finite(status.bms_age_ms)?`최근 BMS 프레임 ${format(status.bms_age_ms,0)} ms 전 · 전압·전류 응답 간격은 수집·전송 상태 참고`:'CAN 수신 대기';
     $('bmsSource').textContent=[status.bms_model,status.bms_protocol].filter(Boolean).join(' · ')||'BMS 수신 대기';
     const cells=status.bms_cell_voltages_v||[],validCells=cells.filter(finite);
     $('cellCount').textContent=status.bms_online?`${validCells.length}개 수신 / ${finite(status.bms_cell_count)?status.bms_cell_count:'?'}셀`:'미수신';
-    $('cellSummary').textContent=`최저 ${unit(values.bms_min_cell_voltage_v,'V',3)} / 최고 ${unit(values.bms_max_cell_voltage_v,'V',3)} · 편차 ${unit(values.bms_cell_delta_mv,'mV',0)}`;
+    $('cellSummary').textContent=`최저 ${unit(statusValues.bms_min_cell_voltage_v,'V',3)} / 최고 ${unit(statusValues.bms_max_cell_voltage_v,'V',3)} · 편차 ${unit(statusValues.bms_cell_delta_mv,'mV',0)}`;
     $('cells').replaceChildren();
     const min=Math.min(...validCells),max=Math.max(...validCells);
     cells.forEach((v,i)=>{const cell=document.createElement('div');cell.className='cell';cell.classList.toggle('low',finite(v)&&v===min);cell.classList.toggle('high',finite(v)&&v===max&&min!==max);cell.append(`셀 ${i+1}`);const value=document.createElement('b');value.textContent=unit(v,'V',3);cell.append(value);$('cells').append(cell);});

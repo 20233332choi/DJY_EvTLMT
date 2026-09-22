@@ -1,6 +1,7 @@
-param([switch]$OpenDashboard, [switch]$InternetOnly)
+param([switch]$OpenDashboard, [switch]$InternetOnly, [string]$EspPort = '')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($EspPort -and $EspPort -notmatch '^COM\d+$') { throw 'EspPort must be the ESP USB-UART COM port, e.g. COM8.' }
 $root = Split-Path -Parent $PSScriptRoot
 $gateway = Join-Path $root 'gateway\ev_gateway.py'
 Write-Host "Telemetry project: $root"
@@ -30,12 +31,16 @@ foreach ($path in @($python, $ngrok, $ngrokConfig)) {
 }
 $existing = $null
 try { $existing = Invoke-RestMethod 'http://127.0.0.1:8766/api/telemetry' -TimeoutSec 2 } catch {}
+if ($existing -and $EspPort -and ($existing.input_mode -ne 'ESP_USB' -or $existing.input_port -ne $EspPort)) {
+    throw 'A gateway using a different input is already running. Stop that gateway before selecting the ESP USB port.'
+}
 if ($null -eq $existing) {
     $saved = $env:DJY_EV_RELAY_TOKEN
     $env:DJY_EV_RELAY_TOKEN = $relayToken
     try {
         $gateway = Join-Path $root 'gateway\ev_gateway.py'
         $gatewayArgs = @('-u', ('"{0}"' -f $gateway), '--http-host', '127.0.0.1', '--enable-control')
+        if ($EspPort) { $gatewayArgs += @('--serial', $EspPort) }
         if ($InternetOnly) { $gatewayArgs += @('--listen-host', '127.0.0.1') }
         Start-Process -FilePath $python -WindowStyle Hidden -WorkingDirectory $root `
             -ArgumentList $gatewayArgs `
@@ -67,6 +72,7 @@ if (-not $tunnel) {
         '--log', ('"{0}"' -f (Join-Path $toolRoot 'ngrok\agent.log')))
 }
 Write-Host 'PC dashboard: http://127.0.0.1:8766/pit'
+if ($EspPort) { Write-Host "ESP USB-UART: $EspPort, 3000000 baud; wireless samples are de-duplicated." }
 Write-Host "Internet dashboard: $publicUrl/pit"
 Write-Host 'Vehicle commands require the local pit controls; public control requests are refused.'
 if ($OpenDashboard) { Start-Process 'http://127.0.0.1:8766/pit' }
